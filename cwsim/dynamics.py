@@ -1,8 +1,9 @@
 """Clohessy-Wiltshire (CW) relative dynamics.
 
-LVLH frame convention (chief-centered):
+RIC frame convention (chief-centered; also called the Hill frame, and
+loosely LVLH):
     x : radial (away from Earth)
-    y : along-track (chief velocity direction for a circular orbit)
+    y : in-track (chief velocity direction for a circular orbit)
     z : cross-track (orbit normal, completes right-handed triad)
 
 State vector: x = [x, y, z, xdot, ydot, zdot]  (m, m/s)

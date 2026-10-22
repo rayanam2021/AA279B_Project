@@ -27,17 +27,25 @@ Constraints:
     x_i[N] + B dv_i[N] = slot_{sigma(i)}         terminal slot (pos + vel)
     ||dv_i[k]||_2 <= dv_max                      thruster limit per burn
     sum_k ||dv_i[k]||_2 <= fuel_max              per-satellite fuel budget
-    nhat_ij[k]^T (r_i[k] - r_j[k]) >= d_min - s  keep-out sphere, linearized
-    s >= 0                                       (slack, heavily penalized)
+    nhat_ij(t)^T (r_i(t) - r_j(t)) >= d_min - s  keep-out sphere, linearized,
+    s >= 0                                       enforced in CONTINUOUS time
+                                                 (sub-sampled; slack penalized)
 
 The CW dynamics are exactly linear, so the ONLY non-convexity is the pairwise
 keep-out constraint ||r_i - r_j|| >= d_min. Its linearization about the
 previous iterate's relative position (the supporting halfspace of the keep-out
 sphere) is an *inner* approximation of the true feasible set, so every SCP
-iterate that satisfies it is collision-free at the grid nodes; iterating
+iterate that satisfies it is collision-free wherever it is imposed; iterating
 re-aims the halfspace normal nhat to recover optimality. No trust region is
-required for constraint validity. Collision avoidance is enforced at grid
-nodes; a fine-grained post-check reports the true minimum separation.
+required for constraint validity.
+
+Collision avoidance is enforced along the whole trajectory, not only at burn
+nodes: between nodes the coasting state is x(t_k + tau) = Phi(tau)(x_k +
+B dv_k), which is AFFINE in the decision variables, so the keep-out constraint
+is imposed at n_sub sub-sampled times per segment (default every dt/n_sub)
+at no change in problem class. An optional collision_margin pads d_min to
+cover the residual excursion between sub-samples, and a fine-grained
+post-check reports the true minimum separation of the executed plan.
 
 Slot assignment: the 3! (n!) slot permutations are ranked with a cheap
 closed-form two-impulse cost heuristic and the best few are solved exactly.
@@ -67,6 +75,8 @@ class ScpConfig:
     dv_max: float = 0.5         # max impulse magnitude per burn [m/s]
     fuel_max: float = 5.0       # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
+    n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)
+    collision_margin: float = 0.0  # pad on d_min for inter-sample excursion [m]
     w_balance: float = 0.1      # weight on max per-sat fuel (balancing)
     w_tf: float = 0.0           # weight on tf [m/s per s] for the tf trade
     w_slack: float = 1.0        # exact-penalty weight on collision slack [1/m]
@@ -172,12 +182,18 @@ def _solve_fixed_assignment(
     n_steps = max(2, int(round(horizon / cfg.dt)))
     dt = horizon / n_steps
     phi = cw_stm(n, dt)
+    n_sub = max(1, cfg.n_sub)
+    # Position rows of the STM at each sub-sample time tau = (j+1) dt / n_sub:
+    # r(t_k + tau) = S_j (x_k + B dv_k), affine in the decision variables.
+    sub_S = [cw_stm(n, (j + 1) * dt / n_sub)[:3, :] for j in range(n_sub)]
+    d_req = cfg.d_min + cfg.collision_margin
 
-    # Reference trajectories for the first linearization: ballistic coast.
-    ref = np.empty((n_sat, n_steps + 1, 3))
+    # Reference post-burn states at each node for the first linearization:
+    # ballistic coast (no burns).
+    ref = np.empty((n_sat, n_steps + 1, 6))
     for i in range(n_sat):
         for k in range(n_steps + 1):
-            ref[i, k] = (cw_stm(n, k * dt) @ x_delay[i])[:3]
+            ref[i, k] = cw_stm(n, k * dt) @ x_delay[i]
 
     pairs = list(itertools.combinations(range(n_sat), 2))
     prev_total = np.inf
@@ -186,17 +202,17 @@ def _solve_fixed_assignment(
     for it in range(cfg.max_iters):
         dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
         x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
-        slack = cp.Variable((len(pairs), n_steps), nonneg=True)
+        slack = cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
         fuel_cap = cp.Variable(nonneg=True)
+        # Post-burn state at each node, affine in (x, dv).
+        post = [x[i] + _B @ dv[i] for i in range(n_sat)]
 
         cons = []
         fuels = []
         for i in range(n_sat):
             cons.append(x[i][:, 0] == x_delay[i])
             for k in range(n_steps):
-                cons.append(
-                    x[i][:, k + 1] == phi @ (x[i][:, k] + _B @ dv[i][:, k])
-                )
+                cons.append(x[i][:, k + 1] == phi @ post[i][:, k])
             cons.append(
                 x[i][:, n_steps] + _B @ dv[i][:, n_steps]
                 == slots_assigned[i]
@@ -210,16 +226,20 @@ def _solve_fixed_assignment(
             cons.append(fuel_i <= fuel_cap)
             fuels.append(fuel_i)
 
-        # Linearized keep-out spheres (supporting halfspace => conservative).
+        # Linearized keep-out spheres (supporting halfspace => conservative),
+        # enforced at every sub-sample time of every coast segment: the
+        # samples tau = (j+1) dt / n_sub of segment k tile (t_d, t_f].
         for p, (i, j) in enumerate(pairs):
-            for k in range(1, n_steps + 1):
-                d = ref[i, k] - ref[j, k]
-                nrm = np.linalg.norm(d)
-                nhat = d / nrm if nrm > 1e-9 else np.array([0.0, 1.0, 0.0])
-                cons.append(
-                    nhat @ (x[i][:3, k] - x[j][:3, k])
-                    >= cfg.d_min - slack[p, k - 1]
-                )
+            for k in range(n_steps):
+                for jj, S in enumerate(sub_S):
+                    d = S @ ref[i, k] - S @ ref[j, k]
+                    nrm = np.linalg.norm(d)
+                    nhat = d / nrm if nrm > 1e-9 else np.array([0.0, 1.0, 0.0])
+                    a = nhat @ S  # row vector: maps post-burn state -> n.r
+                    cons.append(
+                        a @ (post[i][:, k] - post[j][:, k])
+                        >= d_req - slack[p, k * n_sub + jj]
+                    )
 
         obj = (
             cp.sum(cp.hstack(fuels))
@@ -252,7 +272,8 @@ def _solve_fixed_assignment(
             break
         prev_total = total
         for i in range(n_sat):
-            ref[i] = x[i].value[:3].T  # re-linearize about the new iterate
+            # Re-linearize about the new iterate's post-burn states.
+            ref[i] = (x[i].value + _B @ dv[i].value).T
 
     return result
 

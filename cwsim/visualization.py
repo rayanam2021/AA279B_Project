@@ -1,4 +1,14 @@
-"""Dual-view PyVista visualization: ECI frame (textured Earth) and CW/LVLH frame.
+"""Dual-view PyVista visualization: ECEF frame (textured Earth) and the
+chief-centered CW/RIC relative frame.
+
+Left view (ECEF): the Earth is fixed and satellite positions are rotated by
+the sidereal angle, so trajectories trace the familiar regressing ground-path
+spiral. Because real formation separations (km) are invisible at planetary
+scale, deputy offsets from the chief are exaggerated by ``separation_scale``
+(annotated on screen) so the individual satellites can be told apart.
+
+Right view (CW/RIC): x radial, y in-track, z cross-track, chief at the
+origin, with a grid symmetric about the origin.
 
 Usage:
     viewer = FormationViewer(result)
@@ -47,13 +57,20 @@ def _polyline(points: np.ndarray) -> pv.PolyData:
     return poly
 
 
+def _rot_z(angle: float) -> np.ndarray:
+    """Rotation of a vector by -angle about z (ECI -> ECEF for angle = wt)."""
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
 class FormationViewer:
-    """Side-by-side interactive views of a formation in ECI and CW frames."""
+    """Side-by-side interactive views of a formation in ECEF and CW/RIC."""
 
     def __init__(
         self,
         result: SimulationResult,
-        marker_radius_eci: float | None = None,
+        separation_scale: float = 500.0,
+        marker_radius_ecef: float | None = None,
         marker_radius_cw: float | None = None,
         window_size: tuple[int, int] = (1800, 900),
         off_screen: bool = False,
@@ -61,51 +78,90 @@ class FormationViewer:
         self.result = result
         self.frame = 0
         self.playing = False
+        self.sep_scale = separation_scale
 
         res = result
         orbit_r = res.chief_orbit.radius
 
-        # Marker sizes: satellites are km-scale apart on a Mm-scale orbit, so
-        # the ECI markers are exaggerated for visibility.
-        self.marker_r_eci = marker_radius_eci or 0.018 * orbit_r
+        self.marker_r_ecef = marker_radius_ecef or 0.012 * orbit_r
         cw_extent = max(
             np.abs(states[:, :3]).max() for states in res.lvlh.values()
         )
         self.marker_r_cw = marker_radius_cw or max(0.025 * cw_extent, 1.0)
 
+        # Precompute display positions. ECEF: rotate by the sidereal angle;
+        # deputy offsets from the chief are exaggerated for visibility.
+        thetas = OMEGA_EARTH * res.times
+        self._ecef_pos: dict[str, np.ndarray] = {}
+        chief = res.chief_eci
+        rots = np.array([_rot_z(th) for th in thetas])  # (N, 3, 3)
+        self._chief_ecef = np.einsum("nij,nj->ni", rots, chief)
+        for name, traj in res.eci.items():
+            disp = chief + self.sep_scale * (traj - chief)
+            self._ecef_pos[name] = np.einsum("nij,nj->ni", rots, disp)
+
         self.plotter = pv.Plotter(
             shape=(1, 2), window_size=window_size, off_screen=off_screen
         )
-        self._markers_eci: dict[str, tuple[pv.PolyData, np.ndarray]] = {}
+        self._markers_ecef: dict[str, tuple[pv.PolyData, np.ndarray]] = {}
         self._markers_cw: dict[str, tuple[pv.PolyData, np.ndarray]] = {}
-        self._build_eci_view()
+        self._labels_ecef: dict[str, object] = {}
+        self._labels_cw: dict[str, object] = {}
+        self._build_ecef_view()
         self._build_cw_view()
         self._set_frame(0)
 
     # ------------------------------------------------------------------ build
-    def _build_eci_view(self) -> None:
+    def _add_label(self, store: dict, name: str, pos, color) -> None:
+        """Attach a movable 3D text label (pv.Label when available)."""
+        try:
+            label = pv.Label(name, position=np.asarray(pos, dtype=float),
+                             size=16)
+            label.prop.color = color
+            label.prop.bold = True
+            self.plotter.add_actor(label)
+            store[name] = label
+        except AttributeError:  # older pyvista: static label at start point
+            self.plotter.add_point_labels(
+                [np.asarray(pos, dtype=float)], [name], text_color=color,
+                font_size=14, shape=None, show_points=False,
+                always_visible=True,
+            )
+            store[name] = None
+
+    def _build_ecef_view(self) -> None:
         p = self.plotter
         res = self.result
         p.subplot(0, 0)
         p.set_background("black")
-        p.add_text("ECI Frame", font_size=12, color="white")
+        p.add_text("ECEF Frame", font_size=12, color="white")
+        if self.sep_scale != 1.0:
+            p.add_text(
+                f"formation offsets x{self.sep_scale:g} for visibility",
+                position="lower_left", font_size=8, color="gray",
+            )
 
         earth, texture = _load_earth(R_EARTH)
-        self._earth_actor = p.add_mesh(earth, texture=texture, smooth_shading=True)
+        p.add_mesh(earth, texture=texture, smooth_shading=True)
 
-        # Chief reference orbit (one full revolution).
-        t_orbit = np.linspace(0.0, res.chief_orbit.period, 361)
-        ring, _ = res.chief_orbit.states_eci(t_orbit)
-        p.add_mesh(_polyline(ring), color="gray", line_width=1, opacity=0.5)
-
+        # Chief path over the simulated window (a regressing spiral in ECEF).
+        p.add_mesh(
+            _polyline(self._chief_ecef), color="gray", line_width=1,
+            opacity=0.5,
+        )
         for sat in res.satellites:
-            traj = res.eci[sat.name]
+            traj = self._ecef_pos[sat.name]
             p.add_mesh(
                 _polyline(traj), color=sat.color, line_width=2, opacity=0.6
             )
-            marker = pv.Sphere(radius=self.marker_r_eci)
-            self._markers_eci[sat.name] = (marker, marker.points.copy())
+            marker = pv.Sphere(radius=self.marker_r_ecef)
+            self._markers_ecef[sat.name] = (marker, marker.points.copy())
             p.add_mesh(marker, color=sat.color, smooth_shading=True)
+            self._add_label(
+                self._labels_ecef, sat.name,
+                traj[0] + np.array([0.0, 0.0, 2.5 * self.marker_r_ecef]),
+                sat.color,
+            )
 
         p.add_axes(xlabel="X", ylabel="Y", zlabel="Z")
         p.camera_position = "iso"
@@ -115,7 +171,9 @@ class FormationViewer:
         res = self.result
         p.subplot(0, 1)
         p.set_background("#101018")
-        p.add_text("CW / LVLH Frame (chief at origin)", font_size=12, color="white")
+        p.add_text(
+            "CW / RIC Frame (chief at origin)", font_size=12, color="white"
+        )
 
         # Chief location marker at the origin.
         p.add_mesh(
@@ -132,22 +190,32 @@ class FormationViewer:
             marker = pv.Sphere(radius=self.marker_r_cw)
             self._markers_cw[sat.name] = (marker, marker.points.copy())
             p.add_mesh(marker, color=sat.color, smooth_shading=True)
-            p.add_point_labels(
-                [traj[0]],
-                [sat.name],
-                text_color=sat.color,
-                font_size=14,
-                shape=None,
-                show_points=False,
+            self._add_label(
+                self._labels_cw, sat.name,
+                traj[0] + np.array([0.0, 0.0, 2.5 * self.marker_r_cw]),
+                sat.color,
             )
 
+        # Grid symmetric about the chief origin, with uncluttered ticks.
+        bounds = []
+        for axis in range(3):
+            ext = max(
+                abs(res.lvlh[s.name][:, axis]).max() for s in res.satellites
+            )
+            ext = 1.1 * max(ext, 100.0)
+            bounds += [-ext, ext]
         p.show_grid(
+            bounds=bounds,
             xtitle="Radial x [m]",
-            ytitle="Along-track y [m]",
+            ytitle="In-track y [m]",
             ztitle="Cross-track z [m]",
+            n_xlabels=3,
+            n_ylabels=3,
+            n_zlabels=3,
+            fmt="%.0f",
             color="gray",
         )
-        p.add_axes(xlabel="x", ylabel="y", zlabel="z")
+        p.add_axes(xlabel="R", ylabel="I", zlabel="C")
         p.camera_position = "iso"
 
         self._time_text = p.add_text(
@@ -162,13 +230,21 @@ class FormationViewer:
         t = res.times[frame]
 
         for sat in res.satellites:
-            marker, base = self._markers_eci[sat.name]
-            marker.points = base + res.eci[sat.name][frame]
-            marker, base = self._markers_cw[sat.name]
-            marker.points = base + res.lvlh[sat.name][frame, :3]
+            pos_ecef = self._ecef_pos[sat.name][frame]
+            marker, base = self._markers_ecef[sat.name]
+            marker.points = base + pos_ecef
+            if self._labels_ecef[sat.name] is not None:
+                self._labels_ecef[sat.name].position = pos_ecef + np.array(
+                    [0.0, 0.0, 2.5 * self.marker_r_ecef]
+                )
 
-        # Spin the Earth about the ECI z-axis at the sidereal rate.
-        self._earth_actor.orientation = (0.0, 0.0, np.degrees(OMEGA_EARTH * t))
+            pos_cw = res.lvlh[sat.name][frame, :3]
+            marker, base = self._markers_cw[sat.name]
+            marker.points = base + pos_cw
+            if self._labels_cw[sat.name] is not None:
+                self._labels_cw[sat.name].position = pos_cw + np.array(
+                    [0.0, 0.0, 2.5 * self.marker_r_cw]
+                )
 
         self._time_text.set_text(
             "lower_right",

@@ -1,6 +1,7 @@
-"""Frame transformations between ECI and the chief-centered LVLH frame.
+"""Frame transformations between ECI and the chief-centered RIC frame.
 
-LVLH basis (expressed in ECI):
+RIC (radial / in-track / cross-track, also called the Hill frame and loosely
+LVLH) basis, expressed in ECI:
     x_hat = r / |r|            (radial)
     z_hat = (r x v) / |r x v|  (orbit normal / cross-track)
     y_hat = z_hat x x_hat      (along-track)

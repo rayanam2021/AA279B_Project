@@ -184,7 +184,7 @@ def main() -> None:
 
     chief = CircularOrbit(altitude=550e3, inclination=np.radians(51.6))
     cfg = ScpConfig(dt=150.0, dv_max=0.5, fuel_max=5.0, d_min=200.0,
-                    max_iters=6)
+                    collision_margin=10.0, max_iters=6)
     # Recovery time: chosen so no (tf - delay) horizon is a half-period
     # multiple, where the two-impulse baseline's Phi_rv goes singular and its
     # delta-v diverges (horizons: 2.05, 1.90, 1.65, 1.15 orbits).

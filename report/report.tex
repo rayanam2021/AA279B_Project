@@ -54,9 +54,11 @@ Stanford University \\
     \resizebox{0.92\textwidth}{!}{\includegraphics{figures/highlight_fig.png}}
     \vspace{0.35em}
     \captionof{figure}{\textbf{Dual-frame visualization of an SCP formation recovery.}
-    \textbf{Left:} Earth-Centered Inertial (ECI) view of the 550\,km, $51.6^\circ$
-    chief reference orbit with the three-satellite formation. \textbf{Right:}
-    Clohessy--Wiltshire (CW) / LVLH view centered on the virtual chief: after an
+    \textbf{Left:} Earth-Centered Earth-Fixed (ECEF) view of the 550\,km, $51.6^\circ$
+    chief reference orbit (a regressing spiral in the rotating frame) with the
+    three labeled satellites; formation offsets are exaggerated $500\times$ so
+    the satellites are individually visible at planetary scale. \textbf{Right:}
+    Clohessy--Wiltshire (CW) / RIC view centered on the virtual chief: after an
     unexpected $\delta\mathbf{v}_0$ on Sat-2 (green), the SCP planner elects to
     \emph{swap} Sat-2 and Sat-1 (red) rather than fight the natural along-track
     drift, restoring the original 1\,km spacing for 0.30\,m/s of total $\Delta v$
@@ -86,10 +88,14 @@ original spacing, and enforces pairwise keep-out spheres, per-burn thrust
 limits, and per-satellite fuel budgets. Because the CW dynamics are exactly
 linear, the keep-out constraint is the only non-convexity; we linearize it as
 the supporting halfspace of the keep-out sphere, a conservative inner
-approximation that renders every SCP iterate collision-free at the grid nodes.
+approximation that renders every SCP iterate collision-free at every imposed
+sample---and because the inter-node coasting state is affine in the decision
+variables, the constraint is imposed densely in time along the whole
+trajectory, not only at burn nodes.
 Across a sweep of perturbation directions, magnitudes, and reaction delays,
-SCP reduces total constellation $\Delta v$ by $44$--$89\%$ relative to the
-baseline; for along-track perturbations the optimizer \emph{always} chooses to
+SCP reduces total constellation $\Delta v$ by up to $89\%$ (median
+${\approx}56\%$) relative to the baseline; for along-track perturbations the
+optimizer \emph{always} chooses to
 re-slot, confirming that leveraging the drift is cheaper than reversing it. We
 further show that the baseline, which carries no collision logic, can violate
 a 200\,m keep-out that the SCP solution honors, and that its cost diverges when
@@ -99,9 +105,10 @@ the transfer horizon approaches half-period multiples.
 \section*{Abbreviations}
 \noindent
 CW: Clohessy--Wiltshire;\;
+ECEF: Earth-Centered Earth-Fixed;\;
 ECI: Earth-Centered Inertial;\;
 LEO: Low Earth Orbit;\;
-LVLH: Local-Vertical Local-Horizontal;\;
+RIC: Radial--In-track--Cross-track;\;
 RK4: fourth-order Runge--Kutta;\;
 SCP: Sequential Convex Programming;\;
 SOCP: Second-Order Cone Program;\;
@@ -124,7 +131,7 @@ closed-form CW solution~\cite{cw1960}, or whether the natural drift can be
 total constellation fuel consumption and thereby extends mission life.
 
 \textbf{Input and output:} The input to our planner is the post-perturbation
-state of the constellation---each satellite's LVLH relative state
+state of the constellation---each satellite's RIC relative state
 $\mathbf{x}^{(i)} = [x, y, z, \dot{x}, \dot{y}, \dot{z}]^\top \in
 \mathbb{R}^6$---together with a reaction delay $t_d$ (no burns permitted
 before $t_d$) and a recovery time $t_f$. The output is a complete impulsive
@@ -144,7 +151,7 @@ successive linearization.
 
 Our contribution is fourfold: (i) \texttt{cwsim}, a modular Python simulator
 built on the exact closed-form 3-DOF CW STM, with impulsive maneuvers,
-analytic ECI chief propagation, and an interactive dual-frame (ECI + LVLH) 3D
+analytic ECI chief propagation, and an interactive dual-frame (ECEF + RIC) 3D
 visualization; (ii) a closed-form two-impulse CW baseline controller;
 (iii) an SCP recovery planner with slot re-assignment, keep-out spheres,
 thrust and fuel limits, fuel balancing across the constellation, and an outer
@@ -188,8 +195,11 @@ visualization.
 \subsection{Relative dynamics and the 3-DOF STM}
 \label{sec:dynamics}
 
-We use the chief-centered LVLH frame with $x$ radial (zenith), $y$
-along-track, and $z$ cross-track (orbit normal), and a circular chief orbit of
+We use the chief-centered radial--in-track--cross-track (RIC, or Hill) frame
+with $x$ radial (zenith), $y$ in-track (along the chief velocity), and $z$
+cross-track (orbit normal). Some references call this frame LVLH loosely; the
+strict LVLH convention places $z$ toward nadir and $x$ along velocity, and
+differs from RIC by a proper rotation. We take a circular chief orbit of
 radius $a_0 = R_\oplus + 550$\,km with mean motion $n = \sqrt{\mu/a_0^3}$. The
 CW equations are
 \begin{equation}
@@ -224,7 +234,7 @@ I_3\,]$, and the segment epoch reset. A pure along-track offset
 $[0,y_0,0,0,0,0]^\top$ is an equilibrium of \eqref{eq:cw}, which is why the
 unperturbed formation holds its spacing indefinitely. For visualization, the
 chief is propagated analytically in ECI and relative states are mapped to
-absolute position via the LVLH direction-cosine matrix and the transport
+absolute position via the RIC direction-cosine matrix and the transport
 theorem.
 
 \subsection{Two-impulse baseline}
@@ -287,16 +297,23 @@ share. The baseline also carries no collision-avoidance logic.
 \caption{SCP recovery pipeline. The exact CW STM propagates the uncontrolled
 coast; slot permutations are ranked by a closed-form heuristic; each candidate
 assignment is solved as a sequence of SOCPs whose only linearized element is
-the keep-out constraint; the winning plan is re-propagated on a fine grid to
-verify collision clearance between burn nodes.}
+the keep-out constraint, imposed at densely sub-sampled times along every
+coast segment; the winning plan is re-propagated on a fine grid to confirm
+the realized minimum separation.}
 \label{fig:pipeline}
 \end{figure}
 
 Figure~\ref{fig:pipeline} summarizes the planner. We discretize the controlled
 window $[t_d, t_f]$ into $N$ steps of length $\Delta t$ and allow an impulse
 $\Delta\mathbf{v}^{(i)}_k$ for every satellite $i$ at every node $k = 0,\dots,N$
-(``burn as many times as necessary''). For a fixed slot assignment $\sigma$
-and recovery time $t_f$, the subproblem is
+(``burn as many times as necessary''). Burn \emph{times} on a grid are the
+convex surrogate for continuous burn-time optimization, which is non-convex
+(the burn time enters the STM nonlinearly); as $\Delta t \to 0$ the grid
+solution approaches the continuous impulsive optimum, and the group-lasso
+objective below keeps the selected burn set finite and sparse regardless of
+grid density. Path constraints, by contrast, \emph{are} imposed continuously
+in time (sub-sampled between nodes), as described below. For a fixed slot
+assignment $\sigma$ and recovery time $t_f$, the subproblem is
 \begin{align}
 \label{eq:scp}
 \min_{\Delta\mathbf{v}, \mathbf{x}, s, m} \;
@@ -308,8 +325,8 @@ and recovery time $t_f$, the subproblem is
 & \mathbf{x}^{(i)}_N + B\,\Delta\mathbf{v}^{(i)}_N = \mathbf{x}_{\mathrm{slot},\sigma(i)}, \nonumber\\
 & \bigl\|\Delta\mathbf{v}^{(i)}_k\bigr\|_2 \le \Delta v_{\max}, \quad
   \textstyle\sum_k \bigl\|\Delta\mathbf{v}^{(i)}_k\bigr\|_2 \le \min(v_{\mathrm{fuel}},\, m), \nonumber\\
-& \hat{\mathbf{n}}^{ij\top}_k\bigl(\mathbf{r}^{(i)}_k - \mathbf{r}^{(j)}_k\bigr) \ge d_{\min} - s^{ij}_k,
-  \quad s^{ij}_k \ge 0 \;\; \forall\, i<j, \nonumber
+& \hat{\mathbf{n}}^{ij}(\tau)^{\top}\bigl(\mathbf{r}^{(i)}(\tau) - \mathbf{r}^{(j)}(\tau)\bigr) \ge d_{\min} + \epsilon - s^{ij}(\tau), \nonumber\\
+& \qquad s^{ij}(\tau) \ge 0 \quad \forall\, i<j,\;\; \tau \in \mathcal{T}_c, \nonumber
 \end{align}
 where $m$ is an epigraph variable for the maximum per-satellite fuel use. The
 objective combines three terms. The sum of $\ell_2$ impulse norms is the total
@@ -323,20 +340,34 @@ search: candidate $t_f$ values are each solved and compared by
 $J = \Delta v_{\mathrm{tot}} + w_{t_f} t_f$, trading fuel against time out of
 formation.
 
-\textbf{Collision-constraint linearization:} The CW dynamics in
-\eqref{eq:scp} are \emph{exactly} linear, so the pairwise keep-out
-constraint is the only non-convexity. Given the previous iterate's relative position
-$\bar{\mathbf{p}}^{ij}_k$, we constrain the new iterate to the supporting
-halfspace of the keep-out sphere,
-$\hat{\mathbf{n}}^{ij}_k = \bar{\mathbf{p}}^{ij}_k / \|\bar{\mathbf{p}}^{ij}_k\|_2$.
-This halfspace is entirely \emph{outside} the sphere, so the linearization is a
+\textbf{Continuous-time collision enforcement:} The coasting state between
+burn nodes is $\mathbf{x}(t_k + \tau) = \Phi(\tau)\bigl(\mathbf{x}_k +
+B\,\Delta\mathbf{v}_k\bigr)$, which is \emph{affine} in the decision
+variables, so the keep-out constraint can be imposed at arbitrary times
+without changing the problem class. We impose it on the dense sample set
+$\mathcal{T}_c$, every $\Delta t / 6$ along every coast segment (exact STM
+interpolation, no added burn nodes), with a margin $\epsilon = 10$\,m padding
+$d_{\min}$ against the residual excursion between adjacent samples. The
+trajectory therefore cannot pass through a keep-out sphere between burn
+nodes, and a fine-grid STM re-propagation of the executed plan confirms the
+realized minimum separation.
+
+\textbf{Linearization:} The CW dynamics in \eqref{eq:scp} are \emph{exactly}
+linear, so the pairwise keep-out constraint is the only non-convexity. At
+each constraint time $\tau$, the previous iterate supplies the relative
+(line-of-sight) position $\bar{\mathbf{p}}^{ij}(\tau) =
+\bar{\mathbf{r}}^{(i)}(\tau) - \bar{\mathbf{r}}^{(j)}(\tau)$, and we
+constrain the new iterate to the supporting halfspace of the keep-out sphere
+with normal $\hat{\mathbf{n}}^{ij}(\tau) = \bar{\mathbf{p}}^{ij}(\tau) /
+\|\bar{\mathbf{p}}^{ij}(\tau)\|_2$---the hyperplane tangent to the sphere
+where the line of sight exits it, perpendicular to that line of sight. This
+halfspace is entirely \emph{outside} the sphere, so the linearization is a
 conservative inner approximation of the true feasible set: every iterate
-satisfying it is collision-free at the grid nodes, and no trust region is
-needed for constraint validity~\cite{morgan2014,mao2016}. Iteration
+satisfying it is collision-free at every imposed sample, and no trust region
+is needed for constraint validity~\cite{morgan2014,mao2016}. Iteration
 re-aims the halfspace normal to recover optimality; we iterate from a
 ballistic reference until the total $\Delta v$ changes by less than
-$10^{-3}$\,m/s. A fine-grid STM re-propagation then verifies the minimum
-pairwise separation of the executed plan between burn nodes.
+$10^{-3}$\,m/s.
 
 \textbf{Slot assignment:} Any permutation $\sigma$ of the satellites over the
 original slots restores the required spacing. We rank all $n!$ permutations by
@@ -347,7 +378,7 @@ best few. For $n{=}3$ this heuristic-plus-exact search adds negligible cost.
 \subsection{Codebase}
 
 All components are implemented in our Python package \texttt{cwsim}: the STM
-and propagation (\texttt{dynamics}), analytic chief orbit and LVLH/ECI frames
+and propagation (\texttt{dynamics}), analytic chief orbit and RIC/ECI frames
 (\texttt{orbits}, \texttt{frames}), formation containers
 (\texttt{satellites}), the simulation driver (\texttt{simulation}), the SCP
 planner and baseline (\texttt{scp}), and a dual-frame interactive 3D
@@ -381,6 +412,8 @@ Chief orbit & circular, $h_0 = 550$\,km, $i = 51.6^\circ$ \\
 Orbit period $T$ & $95.6$\,min; $n = \sqrt{\mu/a_0^3}$ \\
 Formation & 3 satellites, $\pm1$\,km along-track \\
 Keep-out radius $d_{\min}$ & $200$\,m (pairwise) \\
+Keep-out sampling $\mathcal{T}_c$ & every $\Delta t/6$ (STM interpolation) \\
+Collision margin $\epsilon$ & $10$\,m pad on $d_{\min}$ \\
 Per-burn limit $\Delta v_{\max}$ & $0.5$\,m/s \\
 Fuel budget $v_{\mathrm{fuel}}$ & $5$\,m/s per satellite \\
 Burn grid $\Delta t$ & $150$\,s (sweep); $90$\,s (demo) \\
@@ -401,7 +434,7 @@ matches RK4 integration of \eqref{eq:cw} at the $10^{-12}$\,m level over 1.5
 orbits, satisfies the semigroup property
 $\Phi(t_1{+}t_2) = \Phi(t_2)\Phi(t_1)$ and $\Phi(0) = I$, the two-impulse law
 \eqref{eq:twoimpulse} achieves its target to machine precision, the
-LVLH$\leftrightarrow$ECI mapping round-trips exactly, and the along-track
+RIC$\leftrightarrow$ECI mapping round-trips exactly, and the along-track
 offset equilibrium is preserved.
 
 \begin{table}[t]
@@ -416,7 +449,7 @@ offset equilibrium is preserved.
 STM vs.\ RK4 ($1.5$ orbits), position & $4.1\times10^{-12}$\,m \\
 STM semigroup $\Phi(t_1{+}t_2) = \Phi(t_2)\Phi(t_1)$ & machine precision \\
 Two-impulse arrival position error & $7.1\times10^{-15}$\,m \\
-LVLH $\leftrightarrow$ ECI round-trip & $<10^{-9}$ (all states) \\
+RIC $\leftrightarrow$ ECI round-trip & $<10^{-9}$ (all states) \\
 Along-track equilibrium drift ($5000$\,s) & $<10^{-9}$\,m \\
 \bottomrule
 \end{tabular}
@@ -482,7 +515,7 @@ Radial      & Baseline & 0.154 & 0.308 & 0.616 \\
             & SCP      & \textbf{0.025} & \textbf{0.050} & \textbf{0.100} \\
 \midrule
 Along-track & Baseline & 0.232 & 0.464 & 0.928 \\
-            & SCP      & \textbf{0.159}$^{\mathrm{sw}}$ & \textbf{0.205}$^{\mathrm{sw}}$ & \textbf{0.409}$^{\mathrm{sw}}$ \\
+            & SCP      & \textbf{0.162}$^{\mathrm{sw}}$ & \textbf{0.205}$^{\mathrm{sw}}$ & \textbf{0.409}$^{\mathrm{sw}}$ \\
 \midrule
 Cross-track & Baseline & 0.154 & 0.308 & 0.616 \\
             & SCP      & \textbf{0.050} & \textbf{0.100} & \textbf{0.200} \\
@@ -493,7 +526,7 @@ Cross-track & Baseline & 0.154 & 0.308 & 0.616 \\
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\linewidth]{figures/sweep_trajectories.png}
-\caption{SCP recovery trajectories in the LVLH frame as the perturbation
+\caption{SCP recovery trajectories in the RIC frame as the perturbation
 direction (rows) and reaction delay (columns) vary, at
 $|\delta\mathbf{v}_0| = 0.1$\,m/s. Radial perturbations (top) produce a
 bounded $2{\times}1$ in-plane ellipse that the planner closes for
@@ -546,8 +579,9 @@ secular drift---the expensive, dangerous channel, and the core of the
 project's hypothesis. In \emph{every} along-track case in
 Tables~\ref{tab:delay} and~\ref{tab:magnitude}, the SCP planner chooses to
 swap Sat-2 with the neighbor it is drifting toward rather than reverse the
-drift, cutting cost by $44$--$61\%$ (e.g.\ $0.270$ vs.\ $0.695$\,m/s at
-$t_d = 0.5\,T$). The mechanism is visible in
+drift, cutting cost by $23$--$61\%$ (e.g.\ $0.270$ vs.\ $0.695$\,m/s at
+$t_d = 0.5\,T$; the smallest margin, $23\%$, occurs at the one-orbit delay,
+where the accumulated drift has made even the swap expensive). The mechanism is visible in
 Figure~\ref{fig:trajectories} (middle row): Sat-2 rides its natural drift
 loop into the adjacent slot while Sat-1 flies a short cooperative transfer to
 the vacated center---two cheap maneuvers aligned with the dynamics instead of
@@ -588,11 +622,11 @@ for burn-time-free planning.
 The keep-out constraint is active, not decorative: the along-track drift
 carries Sat-2 directly through Sat-1's position. The baseline, with no
 collision logic, dips to $192.6$\,m minimum separation in one swept
-case---inside the $200$\,m keep-out---while the corresponding SCP solutions
-hold $\geq 198.5$\,m. The residual $1.5$\,m dip below $d_{\min}$ in one SCP
-case occurs \emph{between} burn nodes, where the constraint is not enforced;
-it is bounded by the node spacing and is eliminated by shrinking $\Delta t$
-or padding $d_{\min}$.
+case---inside the $200$\,m keep-out. With the keep-out imposed at every
+$\Delta t/6$ along each coast segment plus the $10$\,m margin, every SCP
+plan's fine-grid minimum separation stays strictly outside the sphere
+($\geq 210.6$\,m across the sweep); the one case where the constraint binds
+pays only $0.003$\,m/s more than node-only enforcement did.
 
 \paragraph{Solver behavior.}
 Across the sweep, subproblems solve in seconds and the SCP loop converges in
@@ -608,10 +642,12 @@ without any integer variables.
 
 Our conclusions inherit the CW assumptions: linearized relative dynamics about
 a circular chief, no $J_2$, drag, or navigation and execution errors, and
-impulsive burns. The keep-out constraint is enforced at burn-grid nodes with
-fine-grid verification rather than in continuous time, and is non-convex, so
-SCP returns locally optimal plans with no global certificate---the assignment
-search mitigates, but does not eliminate, this. The slot-assignment heuristic
+impulsive burns whose times live on a dense grid (continuous burn-time
+optimization is non-convex; the grid solution approaches it as
+$\Delta t \to 0$). The keep-out constraint is sampled densely in time with a
+margin rather than imposed exactly over continuous intervals, and is
+non-convex, so SCP returns locally optimal plans with no global
+certificate---the assignment search mitigates, but does not eliminate, this. The slot-assignment heuristic
 could in principle rank the true optimum below the permutations solved
 exactly, and the study covers a three-satellite formation; the formulation
 scales to $n$ satellites, but the $n!$ assignment enumeration would need
@@ -627,7 +663,8 @@ closed-form two-impulse return-to-slot baseline and an SCP planner that
 coordinates burns across all satellites with re-slotting, keep-out spheres,
 thrust limits, fuel budgets, and fuel balancing. Across perturbation
 directions, magnitudes, and reaction delays, SCP reduces total constellation
-$\Delta v$ by $44$--$89\%$; for along-track perturbations the optimizer always
+$\Delta v$ by up to $89\%$ (median ${\approx}56\%$); for along-track
+perturbations the optimizer always
 re-slots, confirming the project hypothesis that the natural drift should be
 leveraged rather than reversed. The study also surfaced two practical
 warnings for operators: the two-impulse law diverges near half-period
@@ -635,7 +672,8 @@ transfer horizons, and without explicit collision constraints it can violate
 keep-out margins that the convex planner honors by construction.
 
 Future work includes validating the plans against nonlinear two-body and
-$J_2$-perturbed dynamics, continuous-time collision constraints, Monte Carlo
+$J_2$-perturbed dynamics, formal continuous-interval collision certificates
+(bounding the excursion between constraint samples), Monte Carlo
 robustness under navigation and execution errors, larger constellations with
 relaxation-based assignment, and a receding-horizon variant that replans as
 tracking errors accumulate.

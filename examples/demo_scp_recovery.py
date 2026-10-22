@@ -46,6 +46,7 @@ def main() -> None:
     tf_candidates = [1.2 * chief.period, 1.7 * chief.period, 2.2 * chief.period]
     cfg = ScpConfig(
         dt=90.0, dv_max=0.5, fuel_max=5.0, d_min=200.0,
+        collision_margin=10.0,  # covers excursion between keep-out samples
         w_tf=2e-5,  # m/s per s: ~0.11 m/s per orbit of recovery time
     )
 

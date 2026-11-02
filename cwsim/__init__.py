@@ -9,6 +9,18 @@ from .dynamics import (
 )
 from .frames import eci_to_relative, lvlh_dcm, relative_to_eci
 from .orbits import CircularOrbit
+from .roe import (
+    ClosedFormUnavailable,
+    RoeReconfigPlan,
+    cw_to_roe,
+    cw_to_roe_matrix,
+    reachable_dv_min,
+    roe_control_matrix,
+    roe_impulsive_reconfig,
+    roe_stm,
+    roe_to_cw,
+    roe_to_cw_matrix,
+)
 from .satellites import Satellite, along_track_formation
 from .simulation import Simulation, SimulationResult
 from .visualization import FormationViewer
@@ -18,6 +30,7 @@ try:  # SCP planner requires cvxpy; keep the core package usable without it.
         RecoveryPlan,
         ScpConfig,
         apply_plan,
+        baseline_roe_plan,
         baseline_two_impulse_plan,
         plan_recovery,
     )
@@ -36,6 +49,16 @@ __all__ = [
     "lvlh_dcm",
     "relative_to_eci",
     "CircularOrbit",
+    "ClosedFormUnavailable",
+    "RoeReconfigPlan",
+    "cw_to_roe",
+    "cw_to_roe_matrix",
+    "reachable_dv_min",
+    "roe_control_matrix",
+    "roe_impulsive_reconfig",
+    "roe_stm",
+    "roe_to_cw",
+    "roe_to_cw_matrix",
     "Satellite",
     "along_track_formation",
     "Simulation",
@@ -44,6 +67,7 @@ __all__ = [
     "RecoveryPlan",
     "ScpConfig",
     "apply_plan",
+    "baseline_roe_plan",
     "baseline_two_impulse_plan",
     "plan_recovery",
 ]

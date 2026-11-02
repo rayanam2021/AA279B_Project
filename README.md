@@ -41,7 +41,8 @@ half-orbit reaction delay.
 | `satellites.py` | `Satellite` (initial state, color, scheduled impulses), `along_track_formation` builder |
 | `simulation.py` | `Simulation.run()` → time histories in both frames |
 | `visualization.py` | `FormationViewer` — dual-view PyVista window, GIF/screenshot export |
-| `scp.py` | SCP formation-recovery planner (`plan_recovery`) + two-impulse baseline (`baseline_two_impulse_plan`), requires `cvxpy` |
+| `roe.py` | Relative orbital elements: CW ↔ ROE maps, Keplerian ROE STM and control matrix, Chernick & D'Amico closed-form fuel-optimal reconfiguration `roe_impulsive_reconfig` |
+| `scp.py` | SCP formation-recovery planner (`plan_recovery`) + two-impulse and ROE baselines (`baseline_two_impulse_plan`, `baseline_roe_plan`), requires `cvxpy` |
 
 ## SCP formation recovery (`cwsim/scp.py`)
 
@@ -77,6 +78,45 @@ python examples/demo_scp_recovery.py   # SCP vs baseline + 3D visualization
 python examples/sweep_recovery.py      # perturbation/delay trade study -> results/
 ```
 
+## Closed-form ROE reconfiguration (`cwsim/roe.py`)
+
+Fuel-optimal impulsive reconfiguration after Chernick & D'Amico
+([JGCD 2018](https://doi.org/10.2514/1.G002848);
+[AAS 18-308 / JGCD 2021](https://doi.org/10.2514/1.G005218),
+[arXiv:2002.07832](https://arxiv.org/abs/2002.07832)), specialised to the
+Keplerian near-circular case, which is exactly the CW model.
+
+- `cw_to_roe` / `roe_to_cw` map a CW state to the quasi-nonsingular ROE
+  `[δa, δλ, δeₓ, δe_y, δiₓ, δi_y]` and back. The map plus the ROE STM
+  reproduces the CW STM to machine precision. It agrees with ROE built from
+  true Keplerian elements to second order in separation.
+- `roe_impulsive_reconfig(x0, n, tf, x_target)` is a drop-in alternative to
+  `cw_two_impulse`. It returns a plan whose `burns` list of
+  `(t, dv)` pairs works with `propagate_cw_with_impulses` and
+  `Satellite.add_impulse`. It also reports the reachable Δv minimum, the
+  dominant ROE and whether the scheme is provably optimal.
+- In-plane burns are tangential, at the paper's optimal locations
+  `u = atan2(Δδe_y, Δδeₓ) + kπ`. The cross-track burn sits at the phase of
+  `Δδi`. δe-dominant reconfigurations reach the reachable minimum exactly.
+  δλ-dominant ones use the paper's sub-optimal handling, which is improved
+  here by also allowing burns at the window edges and their half-orbit
+  shifts. `candidates="paper"` reproduces the published schemes exactly.
+- Unlike the two-impulse transfer, it has no singularity at multiples of
+  half an orbit. It needs a window of about one orbit or more and raises
+  `ClosedFormUnavailable` otherwise.
+
+```python
+from cwsim import roe_impulsive_reconfig
+plan = roe_impulsive_reconfig(x_at_delay, n, t_f - t_delay, x_target=slot)
+for t, dv in plan.burns:
+    sat.add_impulse(t_delay + t, dv)
+print(plan.summary())
+```
+
+```sh
+python examples/demo_roe_recovery.py   # ROE closed form vs two-impulse CW
+```
+
 ## Conventions
 
 - RIC (Hill) frame, loosely also called LVLH: **x** radial (zenith), **y**
@@ -105,8 +145,13 @@ FormationViewer(result).show()
 
 ```sh
 python tests/test_dynamics.py
+python tests/test_roe.py
 ```
 
 Checks the STM against RK4 integration of the CW ODEs (agreement to ~1e-12 m),
 STM composition `Φ(t₁+t₂) = Φ(t₂)Φ(t₁)`, two-impulse rendezvous arrival error,
 LVLH↔ECI round-trip consistency, and the along-track-offset equilibrium.
+`test_roe.py` checks the CW ↔ ROE maps against the CW STM, the control
+matrix, and Keplerian elements. It also checks that the closed-form solver
+hits the target, is optimal where the reachable-set theory says it must be,
+and stays close to a fine-grid convex optimum elsewhere.

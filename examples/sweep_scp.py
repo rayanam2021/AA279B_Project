@@ -108,9 +108,10 @@ def make_chief():
     return CircularOrbit(altitude=550e3, inclination=0.0)
 
 
-def hit_formation(direction, mag):
+def hit_formation(dv_hit):
+    """The formation with Sat-1 hit by dv_hit (LVLH, m/s) at t = 0."""
     sats = along_track_formation(spacing=SPACING, count=3)
-    sats[0].add_impulse(0.0, mag * DIRECTIONS[direction])
+    sats[0].add_impulse(0.0, np.asarray(dv_hit, dtype=float))
     return sats
 
 
@@ -153,9 +154,9 @@ def solve_cell(task):
     (total_dv, min_sep, max burn) for the reslot plan folded back to fixed
     order; NaN / -1 where there is no such plan.
     """
-    direction, mag, delay_orb, transfer_orb, cfg = task
+    dv_hit, delay_orb, transfer_orb, cfg = task
     chief = make_chief()
-    sats = hit_formation(direction, mag)
+    sats = hit_formation(dv_hit)
     t_delay = delay_orb * chief.period
     tf = t_delay + transfer_orb * chief.period
     out = []
@@ -181,7 +182,7 @@ def solve_cell(task):
 
 def sweep_scp(directions, mag, delays, transfers, cfg, workers):
     """SCP grids per direction, solved in parallel over all cells."""
-    tasks = [(d, mag, dl, tr, cfg) for d in directions
+    tasks = [(mag * DIRECTIONS[d], dl, tr, cfg) for d in directions
              for tr in transfers for dl in delays]
     shape = (len(directions), len(transfers), len(delays))
     raw = np.empty(shape + (3, 3))
@@ -378,7 +379,7 @@ def plot_reorder_case(direction, mag, delay_orb, transfer_orb, cfg,
                       out_path):
     """Trajectories of the best fixed-order plan vs. the reordered plan."""
     chief = make_chief()
-    sats = hit_formation(direction, mag)
+    sats = hit_formation(mag * DIRECTIONS[direction])
     t_delay = delay_orb * chief.period
     tf = t_delay + transfer_orb * chief.period
 

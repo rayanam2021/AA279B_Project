@@ -73,7 +73,7 @@ class ScpConfig:
     """Tuning knobs for the SCP recovery planner (SI units)."""
 
     dt: float = 90.0            # burn-grid spacing [s]
-    dv_max: float = 0.5         # max impulse magnitude per burn [m/s]
+    dv_max: float = 10.0         # max impulse magnitude per burn [m/s]
     fuel_max: float = 5.0       # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
     n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)

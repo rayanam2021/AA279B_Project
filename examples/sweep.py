@@ -40,8 +40,8 @@ from cwsim.scp import ScpConfig
 # Sequential blue ramp (steps 100 -> 700) + chart chrome.
 SEQ_BLUE = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf",
             "#184f95", "#0d366b"]
-SURFACE = "#fcfcfb"
-INK = "#0b0b0b"
+SURFACE = "#ffffff"
+INK = "#060404"
 INK2 = "#52514e"
 MUTED = "#898781"
 GRID = "#e1e0d9"
@@ -130,7 +130,7 @@ def sweep_direction(chief, direction, mag, delays, transfers,
 
 def style_axis(ax):
     ax.set_facecolor(SURFACE)
-    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.tick_params(colors=INK, labelsize=8)
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     for side in ("left", "bottom"):

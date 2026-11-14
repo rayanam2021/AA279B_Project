@@ -85,6 +85,7 @@ class ScpConfig:
     burn_floor: float = 1e-5    # discard solved burns smaller than this [m/s]
     check_dt: float = 15.0      # resolution of the post-solve collision check
     solver: str = "CLARABEL"
+    enforce_collision: bool = True  # False for unconstrained baseline comparison
 
 
 @dataclass
@@ -202,7 +203,8 @@ def _solve_fixed_assignment(
     for it in range(cfg.max_iters):
         dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
         x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
-        slack = cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
+        slack = (cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
+                 if cfg.enforce_collision else None)
         fuel_cap = cp.Variable(nonneg=True)
         # Post-burn state at each node, affine in (x, dv).
         post = [x[i] + _B @ dv[i] for i in range(n_sat)]
@@ -229,7 +231,7 @@ def _solve_fixed_assignment(
         # Linearized keep-out spheres (supporting halfspace => conservative),
         # enforced at every sub-sample time of every coast segment: the
         # samples tau = (j+1) dt / n_sub of segment k tile (t_d, t_f].
-        for p, (i, j) in enumerate(pairs):
+        for p, (i, j) in enumerate(pairs if cfg.enforce_collision else []):
             for k in range(n_steps):
                 for jj, S in enumerate(sub_S):
                     d = S @ ref[i, k] - S @ ref[j, k]
@@ -244,11 +246,15 @@ def _solve_fixed_assignment(
         obj = (
             cp.sum(cp.hstack(fuels))
             + cfg.w_balance * fuel_cap
-            + cfg.w_slack * cp.sum(slack)
+            + (cfg.w_slack * cp.sum(slack) if slack is not None else 0)
         )
         prob = cp.Problem(cp.Minimize(obj), cons)
         try:
-            prob.solve(solver=cfg.solver)
+            # Avoid the C++ backend integer-ID limit in long sweeps.
+            prob.solve(
+                solver=cfg.solver,
+                canon_backend=cp.SCIPY_CANON_BACKEND,
+            )
         except cp.SolverError:
             return None
         if prob.status not in ("optimal", "optimal_inaccurate"):
@@ -259,7 +265,8 @@ def _solve_fixed_assignment(
             for i in range(n_sat)
             for k in range(n_steps + 1)
         )
-        slack_max = float(slack.value.max()) if slack.value.size else 0.0
+        slack_max = (float(slack.value.max()) if slack is not None
+                     and slack.value is not None and slack.value.size else 0.0)
         converged = abs(prev_total - total) < cfg.tol
         result = ([dv[i].value.copy() for i in range(n_sat)], total,
                   slack_max, it + 1, converged)
@@ -355,6 +362,7 @@ def plan_recovery(
     slots: list[np.ndarray] | None = None,
     n_assignments: int = 3,
     verbose: bool = False,
+    fixed_assignment: tuple[int, ...] | None = None,
 ) -> RecoveryPlan:
     """Plan the minimum-cost multi-satellite recovery via SCP.
 
@@ -372,6 +380,7 @@ def plan_recovery(
         satellites over these slots is allowed.
     n_assignments : how many of the heuristically-ranked slot permutations
         to solve exactly.
+    fixed_assignment : exact satellite-to-slot mapping; disables reordering.
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
@@ -385,7 +394,14 @@ def plan_recovery(
         if horizon <= 0:
             raise ValueError("tf must exceed t_delay")
         x_delay = _states_at_delay(n, satellites, t_delay)
-        for perm in _rank_assignments(n, x_delay, slots, horizon, n_assignments):
+        if fixed_assignment is not None:
+            perm = tuple(fixed_assignment)
+            if sorted(perm) != list(range(len(satellites))):
+                raise ValueError("fixed_assignment must be a permutation")
+            permutations = [perm]
+        else:
+            permutations = _rank_assignments(n, x_delay, slots, horizon, n_assignments)
+        for perm in permutations:
             if verbose:
                 print(f"  tf={tf_c / 60:.1f} min, assignment {perm}:")
             res = _solve_fixed_assignment(

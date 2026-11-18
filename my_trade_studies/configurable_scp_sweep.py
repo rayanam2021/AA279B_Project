@@ -64,8 +64,8 @@ from cwsim.scp import (  # noqa: E402
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # ============================ sweep settings ============================
-THETA_DEG = list(range(0, 90, 10))        # 0 = radial, 90 = along-track
-DV_MAG = [0.10] # [0.05, 0.10, 0.15, 0.20]          # disturbance magnitude [m/s]
+THETA_DEG = list(range(0, 180, 10))        # 0 = radial, 90 = along-track
+DV_MAG = [0.05, 0.10, 0.15, 0.20]          # disturbance magnitude [m/s]
 DELAY_ORBITS = [0.10, 0.25, 0.50, 0.75, 1.00]
 RECOVERY_ORBITS = 2.15                     # tf - t_delay [orbits]; not a round number (CW singularity)
 SPACING_M = 1000.0

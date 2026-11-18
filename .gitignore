@@ -3,3 +3,4 @@ __pycache__/
 results_quick/
 *.gif
 scratch_*.png
+*.DS_Store

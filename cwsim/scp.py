@@ -74,7 +74,7 @@ class ScpConfig:
 
     dt: float = 90.0            # burn-grid spacing [s]
     dv_max: float = 10.0         # max impulse magnitude per burn [m/s]
-    fuel_max: float = 0.0       # per-satellite delta-v budget [m/s]
+    fuel_max: float = np.inf    # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
     n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)
     collision_margin: float = 0.0  # pad on d_min for inter-sample excursion [m]

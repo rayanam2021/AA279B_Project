@@ -8,6 +8,12 @@ Figures (saved next to the first CSV unless --out is given):
                           coloured by reaction delay; points below the diagonal
                           mean method B is cheaper
 
+Cases where the uncontrolled drift leaves a satellite inside another's keep-out
+sphere at t_delay (the start of the recovery) are planner-independent bad starts:
+they are drawn in amber on the dv map, left out of its colour scale, and
+excluded from the comparison plot and win summary. The check uses the CSV's
+sep_at_delay column, or recomputes it from the scenario for older CSVs.
+
 Each sweep is labelled from its filename, sweep_<label>_<date>_<time>.csv,
 so two configurations of the same method (e.g. sweep_scp_*.csv and
 sweep_scp_two_imp_*.csv, both method=scp) are kept apart. Override with --labels.
@@ -22,14 +28,17 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import LinearSegmentedColormap, LogNorm
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, LogNorm
+from matplotlib.patches import Patch
 
-from configurable_scp_sweep import RESULTS_DIR, load_sweep
+from configurable_scp_sweep import CONFIG, RESULTS_DIR, load_sweep, separation_at_delay
 
 # Chart chrome and ordered blue ramp (light -> dark) for delay / magnitude.
 INK, INK_2, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb"
 BLUE_RAMP = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
 DELAY_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]  # validated ordinal steps
+KOZ_START = "#eb6834"   # case starts inside the keep-out (excluded)
+MISSING = "#f0efec"     # failed / missing case
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -53,30 +62,50 @@ def latest_per_method() -> list[Path]:
     return list(latest.values())
 
 
-def case_lookup(r) -> dict[tuple, float]:
-    """(theta, dv_mag, delay) -> total_dv, NaN for failed cases."""
-    return {(t, m, d): dv for t, m, d, dv in
-            zip(r["theta_deg"], r["dv_mag"], r["delay_orbits"], r["total_dv"])}
+def starts_in_koz(r) -> np.ndarray:
+    """True where a satellite is inside a keep-out sphere at t_delay."""
+    sep = r.get("sep_at_delay")
+    if sep is None or not np.issubdtype(sep.dtype, np.floating):  # older CSV
+        sep = np.array([separation_at_delay(t, m, d) for t, m, d in
+                        zip(r["theta_deg"], r["dv_mag"], r["delay_orbits"])])
+    return sep < CONFIG.d_min
+
+
+def case_lookup(r, exclude_koz=False) -> dict[tuple, float]:
+    """(theta, dv_mag, delay) -> total_dv, NaN for failed cases (and, with
+    exclude_koz, for cases that start inside the keep-out)."""
+    dv = np.where(r["koz_start"], np.nan, r["total_dv"]) if exclude_koz else r["total_dv"]
+    return {(t, m, d): v for t, m, d, v in
+            zip(r["theta_deg"], r["dv_mag"], r["delay_orbits"], dv)}
 
 
 def plot_dv_maps(sweeps: dict, out: Path):
     """Heatmap of total dv over (theta, delay); rows = methods, columns = dv magnitude."""
     first = next(iter(sweeps.values()))
     thetas, mags, delays = (np.unique(first[k]) for k in ("theta_deg", "dv_mag", "delay_orbits"))
-    all_dv = np.concatenate([r["total_dv"] for r in sweeps.values()])
+    all_dv = np.concatenate([np.where(r["koz_start"], np.nan, r["total_dv"])
+                             for r in sweeps.values()])
     norm = LogNorm(np.nanmin(all_dv[all_dv > 0]), np.nanmax(all_dv))
     cmap = LinearSegmentedColormap.from_list("blue", BLUE_RAMP)
-    cmap.set_bad("#f0efec")  # failed / missing cases
+    cmap.set_bad(MISSING)
+    koz_cmap = ListedColormap([KOZ_START])
+    koz_cmap.set_bad((0, 0, 0, 0))  # transparent where the case starts clear
 
     fig, axes = plt.subplots(len(sweeps), len(mags), figsize=(3.2 * len(mags), 2.2 * len(sweeps) + 0.8),
                              sharex=True, sharey=True, squeeze=False, layout="constrained")
     for row, (method, r) in enumerate(sweeps.items()):
-        lookup = case_lookup(r)
+        lookup = case_lookup(r, exclude_koz=True)
+        koz = {(t, m, d): k for t, m, d, k in
+               zip(r["theta_deg"], r["dv_mag"], r["delay_orbits"], r["koz_start"])}
         for col, mag in enumerate(mags):
             grid = np.array([[lookup.get((t, mag, d), np.nan) for t in thetas] for d in delays])
+            koz_grid = np.array([[1.0 if koz.get((t, mag, d)) else np.nan for t in thetas]
+                                 for d in delays])
             ax = axes[row, col]
             im = ax.pcolormesh(thetas, np.arange(len(delays)), grid, cmap=cmap, norm=norm,
                                shading="nearest", edgecolors=SURFACE, linewidth=0.5)
+            ax.pcolormesh(thetas, np.arange(len(delays)), koz_grid, cmap=koz_cmap,
+                          shading="nearest", edgecolors=SURFACE, linewidth=0.5)
             ax.set_yticks(range(len(delays)), [f"{d:g}" for d in delays])
             ax.set_xticks([0, 90, 180, 270])
             ax.tick_params(length=0)
@@ -87,6 +116,9 @@ def plot_dv_maps(sweeps: dict, out: Path):
             if col == 0:
                 ax.set_ylabel(f"{method}\ndelay [orbits]")
     fig.colorbar(im, ax=axes, label="total recovery Δv [m/s]", shrink=0.9, pad=0.01)
+    fig.legend(handles=[Patch(color=KOZ_START, label="starts inside keep-out (excluded)"),
+                        Patch(color=MISSING, label="failed / missing")],
+               loc="outside lower right", ncol=2, frameon=False, fontsize=8)
     fig.supxlabel("disturbance angle θ [deg]  (0 radial, 90 along-track)", color=INK_2, fontsize=9)
     fig.suptitle("Total recovery Δv across the sweep", color=INK)
     fig.savefig(out, dpi=200)
@@ -95,7 +127,7 @@ def plot_dv_maps(sweeps: dict, out: Path):
 
 def plot_comparison(name_a, ra, name_b, rb, thetas, out: Path):
     """Scatter of method A vs method B total dv at the given angles, coloured by delay."""
-    la, lb = case_lookup(ra), case_lookup(rb)
+    la, lb = case_lookup(ra, exclude_koz=True), case_lookup(rb, exclude_koz=True)
     delays = np.unique(ra["delay_orbits"])
     mags = np.unique(ra["dv_mag"])
     shared = [k for k in la if k in lb and np.isfinite(la[k]) and np.isfinite(lb[k])]
@@ -124,15 +156,20 @@ def plot_comparison(name_a, ra, name_b, rb, thetas, out: Path):
         ax.grid(color=GRID, lw=0.5, which="major")
         ax.legend(title="reaction delay", frameon=False, fontsize=8, title_fontsize=8, loc="upper left",
                   bbox_to_anchor=(0, 0.92))
-    fig.suptitle(f"{name_a} vs {name_b}: along-track disturbance", color=INK)
+    fig.suptitle(f"{name_a} vs {name_b}  (cases starting inside the keep-out excluded)",
+                 color=INK)
     fig.savefig(out, dpi=200)
     print(f"saved {out}")
 
 
 def print_win_summary(name_a, ra, name_b, rb):
     """How often each method is cheaper, per delay, over every angle and magnitude."""
-    la, lb = case_lookup(ra), case_lookup(rb)
-    print(f"\n{name_b} cheaper than {name_a} (all angles and magnitudes):")
+    la, lb = case_lookup(ra, exclude_koz=True), case_lookup(rb, exclude_koz=True)
+    n_koz = len({k for r in (ra, rb) for k, flag in
+                 zip(zip(r["theta_deg"], r["dv_mag"], r["delay_orbits"]), r["koz_start"])
+                 if flag})
+    print(f"\n{name_b} cheaper than {name_a} (all angles and magnitudes; "
+          f"excluded {n_koz} cases that start inside the keep-out):")
     for delay in np.unique(ra["delay_orbits"]):
         keys = [k for k in la if k[2] == delay and k in lb]
         ratio = np.array([lb[k] / la[k] for k in keys])
@@ -159,12 +196,14 @@ def main():
     sweeps = {}
     for i, path in enumerate(paths):
         r = load_sweep(path)
+        r["koz_start"] = starts_in_koz(r)
         label = args.labels[i] if args.labels else sweep_label(path)
         if label in sweeps:  # same label twice (e.g. two runs of one config)
             label = f"{label} ({path.stem.split('_', 1)[1].rsplit('_', 2)[-2]})"
         sweeps[label] = r
         print(f"{path.name}: label={label}, method={r['method'][0]}, "
-              f"{len(r['total_dv'])} cases, {np.sum(r['status'] != 'ok')} failed")
+              f"{len(r['total_dv'])} cases, {np.sum(r['status'] != 'ok')} failed, "
+              f"{r['koz_start'].sum()} start inside the keep-out")
     out_dir = args.out or paths[0].parent
     out_dir.mkdir(parents=True, exist_ok=True)
 

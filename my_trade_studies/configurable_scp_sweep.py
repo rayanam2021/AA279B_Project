@@ -76,7 +76,7 @@ CONFIG = ScpConfig(
     d_min=200.0,          # keep-out radius [m]
     w_balance=0.0,
 )
-METHOD = "scp"            # default planner; override with --method
+METHOD = "scp_reslot"            # default planner; override with --method
 # ========================================================================
 
 
@@ -88,7 +88,7 @@ def scp(chief, sats, td, tf):
 
 
 def scp_reslot(chief, sats, td, tf):
-    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True)
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True, initial_guess=convex_guess)
 
 
 def convex(chief, sats, td, tf):
@@ -118,7 +118,7 @@ METHODS = {
 SAT_NAMES = [f"Sat-{i + 1}" for i in range(N_SATS)]
 FIELDS = (
     ["method", "theta_deg", "dv_mag", "delay_orbits", "recovery_orbits", "t_delay", "tf",
-     "status", "error", "runtime_s",
+     "sep_at_delay", "status", "error", "runtime_s",
      "total_dv"] + [f"dv_{name}" for name in SAT_NAMES] +
     ["n_burns", "max_burn_dv", "assignment", "reslotted", "objective",
      "min_separation", "min_sep_recovery", "koz_ok", "slack_max", "iterations", "converged",
@@ -166,7 +166,8 @@ def summarise(plan: RecoveryPlan, chief, sats) -> dict:
     }
 
 
-def run_case(method: str, theta_deg: float, dv_mag: float, delay_orbits: float) -> dict:
+def build_case(theta_deg: float, dv_mag: float, delay_orbits: float):
+    """The sweep scenario for one case: (chief, sats, t_delay, tf)."""
     chief = CircularOrbit(altitude=550e3, inclination=np.radians(51.6))
     sats = along_track_formation(spacing=SPACING_M, count=N_SATS)
     theta = np.radians(theta_deg)
@@ -174,9 +175,32 @@ def run_case(method: str, theta_deg: float, dv_mag: float, delay_orbits: float) 
         0.0, dv_mag * np.array([np.cos(theta), np.sin(theta), 0.0]))
     td = delay_orbits * chief.period
     tf = td + RECOVERY_ORBITS * chief.period
+    return chief, sats, td, tf
+
+
+def _sep_at(chief, sats, td) -> float:
+    """Minimum pairwise separation [m] at t_delay, after the uncontrolled drift."""
+    pos = [propagate_cw_with_impulses(s.x0, chief.mean_motion, np.array([td]),
+                                      list(s.impulses))[0, :3] for s in sats]
+    return min(np.linalg.norm(a - b) for a, b in itertools.combinations(pos, 2))
+
+
+def separation_at_delay(theta_deg: float, dv_mag: float, delay_orbits: float) -> float:
+    """Minimum pairwise separation [m] at the start of the recovery (t_delay).
+
+    Below CONFIG.d_min the planner starts inside a keep-out sphere. This depends
+    only on the scenario, not the planner, so it can be recomputed for old CSVs.
+    """
+    chief, sats, td, _ = build_case(theta_deg, dv_mag, delay_orbits)
+    return _sep_at(chief, sats, td)
+
+
+def run_case(method: str, theta_deg: float, dv_mag: float, delay_orbits: float) -> dict:
+    chief, sats, td, tf = build_case(theta_deg, dv_mag, delay_orbits)
 
     row = dict(method=method, theta_deg=theta_deg, dv_mag=dv_mag, delay_orbits=delay_orbits,
-               recovery_orbits=RECOVERY_ORBITS, t_delay=td, tf=tf, status="ok", error="")
+               recovery_orbits=RECOVERY_ORBITS, t_delay=td, tf=tf,
+               sep_at_delay=_sep_at(chief, sats, td), status="ok", error="")
     start = time.perf_counter()
     try:
         plan = METHODS[method](chief, sats, td, tf)
@@ -235,7 +259,9 @@ def main():
     if args.resume:
         out = args.resume
         with out.open(newline="") as f:
-            done_rows = list(csv.DictReader(f))
+            reader = csv.DictReader(f)
+            done_rows = list(reader)
+            fields = reader.fieldnames  # keep the file's columns (older CSVs lack some)
         methods = {r["method"] for r in done_rows}
         if methods - {args.method}:
             parser.error(f"{out} holds method(s) {methods}, not {args.method!r}")
@@ -244,6 +270,7 @@ def main():
         cases = [c for c in cases if tuple(map(float, c)) not in done]
         print(f"Resuming {out}: {len(done)} cases done, {len(cases)} to run", flush=True)
     else:
+        fields = FIELDS
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = args.out or RESULTS_DIR / f"sweep_{args.method}_{stamp}.csv"
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +285,7 @@ def main():
         print("caffeinate on: system sleep blocked while the sweep runs", flush=True)
 
     with out.open("a" if args.resume else "x", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS, restval="")
+        writer = csv.DictWriter(f, fieldnames=fields, restval="", extrasaction="ignore")
         if not args.resume:
             writer.writeheader()
 

@@ -149,7 +149,7 @@ def _rank_assignments(
     x_delay: list[np.ndarray],
     slots: list[np.ndarray],
     horizon: float,
-    n_keep: int,
+    n_keep: int | None,
 ) -> list[tuple[int, ...]]:
     """Rank slot permutations by a closed-form two-impulse cost heuristic."""
     n_sat = len(x_delay)
@@ -163,7 +163,7 @@ def _rank_assignments(
                 cost[i, s] = np.inf
     perms = list(itertools.permutations(range(n_sat)))
     perms.sort(key=lambda p: sum(cost[i, p[i]] for i in range(n_sat)))
-    return perms[:n_keep]
+    return perms[:n_keep] if n_keep is not None else perms
 
 
 def _solve_fixed_assignment(
@@ -397,8 +397,7 @@ def plan_recovery(
     t_delay: float,
     tf: float | list[float],
     config: ScpConfig | None = None,
-    slots: list[np.ndarray] | None = None,
-    n_assignments: int = -1,
+    n_assignments: int | None = None,
     verbose: bool = False,
     allow_reslot: bool = True,
 ) -> RecoveryPlan:
@@ -413,9 +412,6 @@ def plan_recovery(
     tf : recovery time [s], or a list of candidate times. With a list, each
         candidate is solved and the best objective total_dv + w_tf*tf wins
         (set config.w_tf > 0 to actually trade fuel against recovery time).
-    slots : target slot states (default: each satellite's original x0, i.e.
-        the pre-perturbation formation geometry). Any permutation of the
-        satellites over these slots is allowed.
     n_assignments : how many of the heuristically-ranked slot permutations
         to solve exactly.
     allow_reslot : if False, every satellite must return to its own slot
@@ -424,8 +420,7 @@ def plan_recovery(
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
-    if slots is None:
-        slots = [sat.x0.copy() for sat in satellites]
+    slots = [sat.x0.copy() for sat in satellites]
     tf_candidates = np.atleast_1d(np.asarray(tf, dtype=float))
 
     best: RecoveryPlan | None = None

@@ -37,7 +37,7 @@ from configurable_scp_sweep import CONFIG, RESULTS_DIR, load_sweep, separation_a
 INK, INK_2, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#fcfcfb"
 BLUE_RAMP = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
 DELAY_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]  # validated ordinal steps
-KOZ_START = "#eb6834"   # case starts inside the keep-out (excluded)
+KOZ_START = "#000000"   # case starts inside the keep-out (excluded)
 MISSING = "#f0efec"     # failed / missing case
 
 plt.rcParams.update({

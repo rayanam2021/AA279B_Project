@@ -21,6 +21,7 @@ from cwsim import (
     plan_recovery,
     propagate_cw_with_impulses,
 )
+from cwsim.scp import convex_guess
 
 
 def test_scp_restores_formation() -> None:
@@ -109,7 +110,37 @@ def test_baseline_convex_plan() -> None:
     print(f"dv_max=0.02 respected ({capped.total_dv:.5f} m/s):        PASS")
 
 
+def test_scp_controlled_only_moves_perturbed() -> None:
+    """With controlled=[perturbed] the neighbours never burn, the perturbed
+    satellite still reaches its slot, and the keep-out is respected."""
+    chief = CircularOrbit(altitude=550e3, inclination=np.radians(51.6))
+    n = chief.mean_motion
+    sats = along_track_formation(spacing=1000.0, count=3)
+    sats[1].add_impulse(0.0, np.array([0.0, 0.1, 0.0]))  # drifts toward Sat-1
+
+    t_delay, tf = 0.25 * chief.period, 2.4 * chief.period
+    cfg = ScpConfig(collision_margin=10.0, d_min=200.0)
+    plan = plan_recovery(chief, sats, t_delay, tf, cfg, allow_reslot=False,
+                         initial_guess=convex_guess, controlled=["Sat-2"])
+    assert plan.converged
+    assert plan.burns["Sat-1"] == [] and plan.burns["Sat-3"] == [], plan.burns
+    assert plan.assignment == (0, 1, 2)
+    impulses = list(sats[1].impulses) + plan.burns["Sat-2"]
+    xf = propagate_cw_with_impulses(sats[1].x0, n, np.array([tf + 1e-6]), impulses)[0]
+    assert np.abs(xf[:3] - sats[1].x0[:3]).max() < 1e-2, xf
+    assert np.abs(xf[3:] - sats[1].x0[3:]).max() < 1e-5, xf
+    assert plan.min_separation >= cfg.d_min, plan.min_separation
+    print(f"controlled=[Sat-2]: {plan.summary()}  PASS")
+
+    # Re-slotting keeps uncontrolled satellites in their own slots.
+    reslot = plan_recovery(chief, sats, t_delay, tf, cfg, allow_reslot=True,
+                           initial_guess=convex_guess, controlled=["Sat-2"])
+    assert reslot.assignment == (0, 1, 2)
+    assert reslot.burns["Sat-1"] == [] and reslot.burns["Sat-3"] == []
+
+
 if __name__ == "__main__":
     test_scp_restores_formation()
     test_baseline_convex_plan()
+    test_scp_controlled_only_moves_perturbed()
     print("\nSCP test passed.")

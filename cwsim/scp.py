@@ -2,7 +2,9 @@
 
 Plans impulsive burns for ALL satellites to restore an equally spaced
 formation by time tf, allowing the satellites to swap slots (any ordering that
-reproduces the original separations is acceptable).
+reproduces the original separations is acceptable). plan_recovery's
+`controlled` argument restricts the burns to a subset of satellites (e.g.
+only the perturbed one); the rest coast and keep their own slots.
 
 Problem formulation (per slot assignment, per candidate tf)
 -----------------------------------------------------------
@@ -54,7 +56,7 @@ closed-form two-impulse cost heuristic and the best few are solved exactly.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
 import cvxpy as cp
@@ -186,13 +188,17 @@ def _guess_reference(
     horizon: float,
     n_steps: int,
     initial_guess: InitialGuess,
+    active: list[bool] | None = None,
 ) -> np.ndarray:
-    """Post-burn reference states (n_sat, n_steps+1, 6) of the guessed burns."""
+    """Post-burn reference states (n_sat, n_steps+1, 6) of the guessed burns.
+
+    Satellites with active[i] False cannot burn, so they always coast."""
     phi = cw_stm(n, horizon / n_steps)
     ref = np.empty((len(x_delay), n_steps + 1, 6))
     for i, (x0, target) in enumerate(zip(x_delay, slots_assigned)):
+        guess = initial_guess if active is None or active[i] else ballistic_guess
         dv = np.asarray(
-            initial_guess(n, x0, target, horizon, n_steps), dtype=float
+            guess(n, x0, target, horizon, n_steps), dtype=float
         )
         if dv.shape != (3, n_steps + 1):
             raise ValueError(
@@ -220,7 +226,7 @@ class ScpConfig:
     w_tf: float = 0.0           # weight on tf [m/s per s] for the tf trade
     w_slack: float = 1.0        # exact-penalty weight on collision slack [1/m]
     max_iters: int = 50        # SCP iterations
-    tol: float = 1e-3           # convergence: change in total dv [m/s]
+    tol: float = 1e-3           # convergence: relative decrease in objective J
     burn_floor: float = 1e-5    # discard solved burns smaller than this [m/s]
     check_dt: float = 10.0      # resolution of the post-solve collision check
     solver: str = "CLARABEL"
@@ -313,16 +319,22 @@ def _solve_fixed_assignment(
     verbose: bool = False,
     initial_guess: InitialGuess = ballistic_guess,
     collision_avoidance: bool = True,
+    active: list[bool] | None = None,
 ) -> tuple[list[np.ndarray], float, float, int, bool] | None:
     """SCP solve for one slot assignment over [0, horizon] after the delay.
 
     With collision_avoidance=False the keep-out constraints are dropped, the
     problem is convex, and a single solve is returned (no iteration).
 
+    active : per-satellite flag; a satellite with active[i] False has its
+        burns fixed to zero and no terminal-slot constraint (it just coasts),
+        but still takes part in the keep-out constraints. None = all active.
+
     Returns (dv arrays [(3, N+1) per sat], total_dv, slack_max, iters,
     converged), or None if the convex subproblem fails.
     """
     n_sat = len(x_delay)
+    active = [True] * n_sat if active is None else list(active)
     n_steps = max(2, int(round(horizon / cfg.dt)))
     dt = horizon / n_steps
     phi = cw_stm(n, dt)
@@ -339,7 +351,7 @@ def _solve_fixed_assignment(
     # Reference post-burn states at each node for the first linearization,
     # from the user-selectable initial guess (default: ballistic coast).
     ref = _guess_reference(
-        n, x_delay, slots_assigned, horizon, n_steps, initial_guess
+        n, x_delay, slots_assigned, horizon, n_steps, initial_guess, active
     )
 
     pairs = list(itertools.combinations(range(n_sat), 2))
@@ -369,8 +381,11 @@ def _solve_fixed_assignment(
         constraints += [
             x[i][:, 0] == x_delay[i],                        # initial state
             x[i][:, 1:] == phi @ post[i][:, :-1],            # CW dynamics
-            post[i][:, n_steps] == slots_assigned[i],        # final slot
         ]
+        if active[i]:
+            constraints.append(post[i][:, n_steps] == slots_assigned[i])  # final slot
+        else:
+            constraints.append(dv[i] == 0)                   # may not burn
         norms = cp.norm(dv[i], 2, axis=0)                    # |dv| per node
         fuel_i = cp.sum(norms)
         constraints += [
@@ -410,7 +425,7 @@ def _solve_fixed_assignment(
                        >= d_req - slack[p_idx])
         return out
 
-    prev_total = np.inf
+    J_prev = np.inf
     result = None
 
     for it in range(cfg.max_iters):
@@ -426,18 +441,23 @@ def _solve_fixed_assignment(
         total = float(sum(np.linalg.norm(dv[i].value, axis=0).sum()
                           for i in range(n_sat)))
         slack_max = float(slack.value.max()) if slack.value.size else 0.0
+        # Converge on the full subproblem objective (fuel + balancing + slack
+        # penalty): stop once its decrease is within a relative tolerance and
+        # the KOZ is met (slack below 1 mm).
+        J = prob.value
         converged = (not collision_avoidance
-                     or abs(prev_total - total) < cfg.tol)
+                     or ((J_prev - J) <= cfg.tol * max(1.0, abs(J))
+                         and slack_max < 1e-3))  # metres
+        J_prev = J
         result = ([dv[i].value.copy() for i in range(n_sat)], total,
                   slack_max, it + 1, converged)
         if verbose:
             print(
-                f"    SCP iter {it + 1}: dv={total:.4f} m/s, "
+                f"    SCP iter {it + 1}: J={J:.4f}, dv={total:.4f} m/s, "
                 f"slack={slack_max:.2e} m"
             )
         if converged:
             break
-        prev_total = total
 
         for i in range(n_sat):
             # Re-linearize about the new iterate's post-burn states for the KOZ
@@ -595,6 +615,7 @@ def plan_recovery(
     allow_reslot: bool = True,
     initial_guess: InitialGuess = ballistic_guess,
     collision_avoidance: bool = True,
+    controlled: Collection[str] | None = None,
 ) -> RecoveryPlan:
     """Plan the minimum-cost multi-satellite recovery via SCP.
 
@@ -624,10 +645,23 @@ def plan_recovery(
         same grid, dynamics, objective and burn limits as the SCP, so it is
         the fuel lower bound for the SCP at the same settings. The kept
         burns are polished onto the slots (see `_polish_burns`).
+    controlled : names of the satellites allowed to burn (default: all).
+        The others coast on their current trajectory and keep their own
+        slot, but the controlled satellites must still avoid them. Pass
+        just the perturbed satellite to match the single-satellite
+        baselines without letting the SCP move neighbours out of the way.
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
     slots = [sat.x0.copy() for sat in satellites]
+    names = [sat.name for sat in satellites]
+    if controlled is None:
+        active = [True] * len(satellites)
+    else:
+        unknown = set(controlled) - set(names)
+        if unknown:
+            raise ValueError(f"controlled names not in the formation: {sorted(unknown)}")
+        active = [name in controlled for name in names]
     tf_candidates = np.atleast_1d(np.asarray(tf, dtype=float))
 
     best: RecoveryPlan | None = None
@@ -640,12 +674,16 @@ def plan_recovery(
             _rank_assignments(n, x_delay, slots, horizon, n_assignments)
             if allow_reslot else [tuple(range(len(satellites)))]
         )
+        # A satellite that can't burn keeps its own slot.
+        perms = [p for p in perms
+                 if all(p[i] == i for i in range(len(p)) if not active[i])]
         for perm in perms:
             if verbose:
                 print(f"  tf={tf_c / 60:.1f} min, assignment {perm}:")
             res = _solve_fixed_assignment(
                 n, x_delay, [slots[perm[i]] for i in range(len(satellites))],
                 horizon, cfg, verbose, initial_guess, collision_avoidance,
+                active,
             )
             if res is None:
                 if verbose:

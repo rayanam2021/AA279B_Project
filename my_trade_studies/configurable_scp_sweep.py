@@ -52,6 +52,7 @@ from cwsim import CircularOrbit, along_track_formation, propagate_cw_with_impuls
 from cwsim.scp import (  # noqa: E402
     RecoveryPlan,
     ScpConfig,
+    ballistic_guess,
     two_impulse_guess,
     convex_guess,
     baseline_roe_plan,
@@ -83,8 +84,12 @@ METHOD = "scp_reslot"            # default planner; override with --method
 # ------------------------------- planners -------------------------------
 # Each planner: fn(chief, sats, t_delay, tf) -> RecoveryPlan
 
+# Without re-slotting only PERTURBED may burn: the neighbours hold their slots,
+# so the planner can't clear a path by moving them.
+
 def scp(chief, sats, td, tf):
-    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False, initial_guess=convex_guess)
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False,
+                         initial_guess=convex_guess, controlled=[PERTURBED])
 
 
 def scp_reslot(chief, sats, td, tf):
@@ -94,7 +99,7 @@ def scp_reslot(chief, sats, td, tf):
 def convex(chief, sats, td, tf):
     # SCP subproblem without keep-out constraints: one convex solve.
     return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False,
-                         collision_avoidance=False)
+                         collision_avoidance=False, controlled=[PERTURBED])
 
 
 def cw(chief, sats, td, tf):
@@ -106,8 +111,8 @@ def roe(chief, sats, td, tf):
 
 
 METHODS = {
-    "scp": scp,
-    "scp_reslot": scp_reslot,
+    "scp_convex": scp,
+    "scp_reslot_convex": scp_reslot,
     "convex": convex,
     "cw": cw,
     "roe": roe,

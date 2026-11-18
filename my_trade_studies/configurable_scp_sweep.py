@@ -47,15 +47,13 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", message="Solution may be inaccurate")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import cvxpy as cp  # noqa: E402
 
 from cwsim import CircularOrbit, along_track_formation, propagate_cw_with_impulses  # noqa: E402
-from cwsim.dynamics import cw_stm  # noqa: E402
 from cwsim.scp import (  # noqa: E402
     RecoveryPlan,
     ScpConfig,
-    _finalize_plan,
-    _states_at_delay,
+    two_impulse_guess,
+    convex_guess,
     baseline_roe_plan,
     baseline_two_impulse_plan,
     plan_recovery,
@@ -85,56 +83,8 @@ METHOD = "scp"            # default planner; override with --method
 # ------------------------------- planners -------------------------------
 # Each planner: fn(chief, sats, t_delay, tf) -> RecoveryPlan
 
-def convex_recovery(chief, sats, t_delay, tf, cfg, allow_reslot=False):
-    """Single convex solve per slot assignment, with NO keep-out constraints.
-
-    Same grid, dynamics, objective and burn limits as plan_recovery's SCP
-    subproblem, minus the collision constraints (so no iteration is needed).
-    """
-    n = chief.mean_motion
-    horizon = tf - t_delay
-    x0 = _states_at_delay(n, sats, t_delay)
-    slots = [sat.x0.copy() for sat in sats]
-    perms = (list(itertools.permutations(range(len(sats)))) if allow_reslot
-             else [tuple(range(len(sats)))])
-    steps = max(2, int(round(horizon / cfg.dt)))
-    phi = cw_stm(n, horizon / steps)
-    B = np.vstack([np.zeros((3, 3)), np.eye(3)])
-
-    best = None
-    for perm in perms:
-        burns = [cp.Variable((3, steps + 1)) for _ in sats]
-        states = [cp.Variable((6, steps + 1)) for _ in sats]
-        fuel_cap = cp.Variable(nonneg=True)
-        constraints, fuels = [], []
-        for i in range(len(sats)):
-            post = states[i] + B @ burns[i]
-            constraints.append(states[i][:, 0] == x0[i])
-            constraints += [states[i][:, k + 1] == phi @ post[:, k] for k in range(steps)]
-            constraints.append(post[:, steps] == slots[perm[i]])
-            norms = cp.norm(burns[i], 2, axis=0)
-            fuel = cp.sum(norms)
-            constraints += [norms <= cfg.dv_max, fuel <= cfg.fuel_max, fuel <= fuel_cap]
-            fuels.append(fuel)
-        problem = cp.Problem(cp.Minimize(sum(fuels) + cfg.w_balance * fuel_cap), constraints)
-        try:
-            problem.solve(solver=cfg.solver)
-        except cp.SolverError:
-            continue
-        if problem.status not in ("optimal", "optimal_inaccurate"):
-            continue
-        plan = _finalize_plan(chief, sats, [b.value.copy() for b in burns], perm,
-                              t_delay, tf, cfg, slack_max=0.0, iters=1,
-                              converged=problem.status == "optimal")
-        if best is None or plan.objective < best.objective:
-            best = plan
-    if best is None:
-        raise RuntimeError("convex solve failed for every assignment")
-    return best
-
-
 def scp(chief, sats, td, tf):
-    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False)
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False, initial_guess=convex_guess)
 
 
 def scp_reslot(chief, sats, td, tf):
@@ -142,7 +92,9 @@ def scp_reslot(chief, sats, td, tf):
 
 
 def convex(chief, sats, td, tf):
-    return convex_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False)
+    # SCP subproblem without keep-out constraints: one convex solve.
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=False,
+                         collision_avoidance=False)
 
 
 def cw(chief, sats, td, tf):

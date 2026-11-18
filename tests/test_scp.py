@@ -15,6 +15,9 @@ from cwsim import (
     CircularOrbit,
     ScpConfig,
     along_track_formation,
+    baseline_convex_plan,
+    baseline_roe_plan,
+    baseline_two_impulse_plan,
     plan_recovery,
     propagate_cw_with_impulses,
 )
@@ -71,6 +74,42 @@ def test_scp_restores_formation() -> None:
           f"{cfg.d_min:.0f} m keep-out:          PASS")
 
 
+def test_baseline_convex_plan() -> None:
+    """Convex baseline reaches the slot, moves only the perturbed satellite,
+    and is no more expensive than the closed-form baselines."""
+    chief = CircularOrbit(altitude=550e3, inclination=np.radians(51.6))
+    n = chief.mean_motion
+    sats = along_track_formation(spacing=1000.0, count=3)
+    sats[1].add_impulse(0.0, np.array([0.05, 0.10, 0.03]))
+    # 2.15-orbit window: whole orbits are singular for the two-impulse CW.
+    t_delay, tf = 0.5 * chief.period, 2.65 * chief.period
+    cfg = ScpConfig(dt=60.0)
+
+    plan = baseline_convex_plan(chief, sats, "Sat-2", t_delay, tf, cfg)
+    impulses = list(sats[1].impulses) + plan.burns["Sat-2"]
+    xf = propagate_cw_with_impulses(sats[1].x0, n, np.array([tf]), impulses)[0]
+    assert np.abs(xf[:3] - sats[1].x0[:3]).max() < 1e-3, xf
+    assert np.abs(xf[3:] - sats[1].x0[3:]).max() < 1e-6, xf
+    assert all(t_delay <= t <= tf for t, _ in plan.burns["Sat-2"])
+    assert plan.burns["Sat-1"] == [] and plan.burns["Sat-3"] == []
+
+    roe = baseline_roe_plan(chief, sats, "Sat-2", t_delay, tf, cfg).total_dv
+    cw = baseline_two_impulse_plan(chief, sats, "Sat-2", t_delay, tf, cfg).total_dv
+    # Grid optimum may sit marginally above CD's continuous-time burn times.
+    assert plan.total_dv <= 1.01 * roe and plan.total_dv <= cw, (
+        plan.total_dv, roe, cw)
+    print(f"convex baseline {plan.total_dv:.5f} m/s "
+          f"(CD {roe:.5f}, two-impulse {cw:.5f}):  PASS")
+
+    # dv_max is honoured.
+    capped = baseline_convex_plan(
+        chief, sats, "Sat-2", t_delay, tf, ScpConfig(dt=60.0, dv_max=0.02)
+    )
+    assert max(np.linalg.norm(d) for _, d in capped.burns["Sat-2"]) <= 0.02 + 1e-6
+    print(f"dv_max=0.02 respected ({capped.total_dv:.5f} m/s):        PASS")
+
+
 if __name__ == "__main__":
     test_scp_restores_formation()
+    test_baseline_convex_plan()
     print("\nSCP test passed.")

@@ -30,9 +30,13 @@ try:  # SCP planner requires cvxpy; keep the core package usable without it.
         RecoveryPlan,
         ScpConfig,
         apply_plan,
+        baseline_convex_plan,
         baseline_roe_plan,
         baseline_two_impulse_plan,
+        ballistic_guess,
+        convex_guess,
         plan_recovery,
+        two_impulse_guess,
     )
 except ImportError:  # pragma: no cover
     pass
@@ -67,7 +71,11 @@ __all__ = [
     "RecoveryPlan",
     "ScpConfig",
     "apply_plan",
+    "baseline_convex_plan",
     "baseline_roe_plan",
     "baseline_two_impulse_plan",
+    "ballistic_guess",
+    "convex_guess",
     "plan_recovery",
+    "two_impulse_guess",
 ]

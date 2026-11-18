@@ -54,6 +54,7 @@ closed-form two-impulse cost heuristic and the best few are solved exactly.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import cvxpy as cp
@@ -66,6 +67,143 @@ from .satellites import Satellite
 
 # Impulse input matrix: dv adds to the velocity half of the state.
 _B = np.vstack([np.zeros((3, 3)), np.eye(3)])
+
+
+# --------------------------------------------------------------------------
+# Initial guesses (first SCP linearization point)
+# --------------------------------------------------------------------------
+
+# An initial guess maps one satellite's transfer problem to impulses on the
+# SCP burn grid:  guess(n, x0, x_target, horizon, n_steps) -> dv (3, n_steps+1)
+# where column k is the impulse at node t_k = k * horizon / n_steps (relative
+# to the reaction delay), x0 is the coasted state at the delay and x_target
+# the assigned slot. The guess only sets the first KOZ linearization; it need
+# not satisfy the terminal, thrust or fuel constraints.
+InitialGuess = Callable[[float, np.ndarray, np.ndarray, float, int], np.ndarray]
+
+
+def ballistic_guess(
+    n: float, x0: np.ndarray, x_target: np.ndarray, horizon: float,
+    n_steps: int,
+) -> np.ndarray:
+    """No burns: linearize about the uncontrolled coast."""
+    return np.zeros((3, n_steps + 1))
+
+
+def two_impulse_guess(
+    n: float, x0: np.ndarray, x_target: np.ndarray, horizon: float,
+    n_steps: int,
+) -> np.ndarray:
+    """Closed-form CW two-impulse transfer: burn at the first and last node.
+
+    Falls back to the ballistic coast if the horizon is singular for the
+    two-impulse solution.
+    """
+    dv = np.zeros((3, n_steps + 1))
+    try:
+        dv[:, 0], dv[:, -1] = cw_two_impulse(x0, n, horizon, x_target)
+    except np.linalg.LinAlgError:
+        pass
+    return dv
+
+
+def _solve_convex_transfer(
+    n: float,
+    x0: np.ndarray,
+    x_target: np.ndarray,
+    horizon: float,
+    n_steps: int,
+    dv_max: float = np.inf,
+    fuel_max: float = np.inf,
+    solver: str = "CLARABEL",
+) -> tuple[np.ndarray | None, str]:
+    """Minimum-fuel single-satellite CW transfer on the burn grid (no KOZ).
+
+    Minimizes sum_k ||dv_k||_2 over impulses at t_k = k * horizon / n_steps
+    with the states eliminated (condensed form):
+
+        Phi(horizon) x0 + sum_k Phi(horizon - t_k) B dv_k == x_target
+
+    subject to ||dv_k|| <= dv_max and sum_k ||dv_k|| <= fuel_max.
+
+    Returns (dv (3, n_steps + 1), status), or (None, status) on failure.
+    """
+    h = horizon / n_steps
+    # Column block k maps dv_k (applied at t_k) to the final state.
+    gain = np.hstack(
+        [cw_stm(n, horizon - k * h) @ _B for k in range(n_steps + 1)]
+    )
+    rhs = np.asarray(x_target, dtype=float) - cw_stm(n, horizon) @ x0
+
+    dv = cp.Variable((3, n_steps + 1))
+    norms = cp.norm(dv, 2, axis=0)
+    constraints = [gain @ cp.vec(dv, order="F") == rhs]
+    if np.isfinite(dv_max):
+        constraints.append(norms <= dv_max)
+    if np.isfinite(fuel_max):
+        constraints.append(cp.sum(norms) <= fuel_max)
+    prob = cp.Problem(cp.Minimize(cp.sum(norms)), constraints)
+    try:
+        prob.solve(solver=solver)
+    except cp.SolverError as exc:
+        return None, f"solver error: {exc}"
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        return None, prob.status
+    return dv.value.copy(), prob.status
+
+
+def convex_guess(
+    n: float, x0: np.ndarray, x_target: np.ndarray, horizon: float,
+    n_steps: int, *, dv_max: float = np.inf, fuel_max: float = np.inf,
+    solver: str = "CLARABEL",
+) -> np.ndarray:
+    """Convex warm start: the satellite's minimum-fuel transfer to its slot
+    on the SCP grid, ignoring the keep-out constraints.
+
+    This is the SCP's own subproblem with the KOZ removed, so the first KOZ
+    linearization is taken about the fuel optimum rather than the coast.
+    Pass the burn limits with functools.partial to match the SCP:
+
+        initial_guess=partial(convex_guess, dv_max=cfg.dv_max,
+                              fuel_max=cfg.fuel_max)
+
+    Each satellite is solved on its own, so the w_balance coupling is ignored
+    (it only affects the guess, not the SCP). Falls back to the ballistic
+    coast if the convex problem fails.
+    """
+    dv, _ = _solve_convex_transfer(
+        n, x0, x_target, horizon, n_steps, dv_max, fuel_max, solver
+    )
+    return dv if dv is not None else ballistic_guess(
+        n, x0, x_target, horizon, n_steps
+    )
+
+
+def _guess_reference(
+    n: float,
+    x_delay: list[np.ndarray],
+    slots_assigned: list[np.ndarray],
+    horizon: float,
+    n_steps: int,
+    initial_guess: InitialGuess,
+) -> np.ndarray:
+    """Post-burn reference states (n_sat, n_steps+1, 6) of the guessed burns."""
+    phi = cw_stm(n, horizon / n_steps)
+    ref = np.empty((len(x_delay), n_steps + 1, 6))
+    for i, (x0, target) in enumerate(zip(x_delay, slots_assigned)):
+        dv = np.asarray(
+            initial_guess(n, x0, target, horizon, n_steps), dtype=float
+        )
+        if dv.shape != (3, n_steps + 1):
+            raise ValueError(
+                f"initial_guess returned shape {dv.shape}, expected "
+                f"(3, {n_steps + 1})"
+            )
+        x = np.asarray(x0, dtype=float)
+        for k in range(n_steps + 1):
+            ref[i, k] = x + _B @ dv[:, k]
+            x = phi @ ref[i, k]
+    return ref
 
 
 @dataclass
@@ -173,8 +311,13 @@ def _solve_fixed_assignment(
     horizon: float,
     cfg: ScpConfig,
     verbose: bool = False,
+    initial_guess: InitialGuess = ballistic_guess,
+    collision_avoidance: bool = True,
 ) -> tuple[list[np.ndarray], float, float, int, bool] | None:
     """SCP solve for one slot assignment over [0, horizon] after the delay.
+
+    With collision_avoidance=False the keep-out constraints are dropped, the
+    problem is convex, and a single solve is returned (no iteration).
 
     Returns (dv arrays [(3, N+1) per sat], total_dv, slack_max, iters,
     converged), or None if the convex subproblem fails.
@@ -193,13 +336,11 @@ def _solve_fixed_assignment(
     # min koz dist
     d_req = cfg.d_min + cfg.collision_margin
 
-    # TODO: switch to CW
-    # Reference post-burn states at each node for the first linearization:
-    # ballistic coast (no burns).
-    ref = np.empty((n_sat, n_steps + 1, 6))
-    for i in range(n_sat):
-        for k in range(n_steps + 1):
-            ref[i, k] = cw_stm(n, k * dt) @ x_delay[i]
+    # Reference post-burn states at each node for the first linearization,
+    # from the user-selectable initial guess (default: ballistic coast).
+    ref = _guess_reference(
+        n, x_delay, slots_assigned, horizon, n_steps, initial_guess
+    )
 
     pairs = list(itertools.combinations(range(n_sat), 2))
     n_cols = n_steps * n_subsamples  # one KOZ sample per (segment k, sub-sample j)
@@ -273,7 +414,8 @@ def _solve_fixed_assignment(
     result = None
 
     for it in range(cfg.max_iters):
-        prob = cp.Problem(obj, constraints + koz_constraints(ref))
+        koz = koz_constraints(ref) if collision_avoidance else []
+        prob = cp.Problem(obj, constraints + koz)
         try:
             prob.solve(solver=cfg.solver)
         except cp.SolverError:
@@ -284,7 +426,8 @@ def _solve_fixed_assignment(
         total = float(sum(np.linalg.norm(dv[i].value, axis=0).sum()
                           for i in range(n_sat)))
         slack_max = float(slack.value.max()) if slack.value.size else 0.0
-        converged = abs(prev_total - total) < cfg.tol
+        converged = (not collision_avoidance
+                     or abs(prev_total - total) < cfg.tol)
         result = ([dv[i].value.copy() for i in range(n_sat)], total,
                   slack_max, it + 1, converged)
         if verbose:
@@ -303,6 +446,36 @@ def _solve_fixed_assignment(
     return result
 
 
+def _polish_burns(
+    n: float,
+    x0: np.ndarray,
+    target: np.ndarray,
+    dv: np.ndarray,
+    horizon: float,
+    floor: float,
+) -> np.ndarray:
+    """Zero the burns below `floor`, then apply the least-norm correction to
+    the kept burns so the coast from x0 lands exactly on `target`.
+
+    Interior-point solvers leave many tiny nonzero burns on the grid. Dropping
+    them alone (as burn_floor does) can leave a cm-level terminal miss after
+    a long coast. The correction is O(solver tolerance) and keeps the support.
+    """
+    n_steps = dv.shape[1] - 1
+    h = horizon / n_steps
+    keep = np.flatnonzero(np.linalg.norm(dv, axis=0) >= floor)
+    out = np.zeros_like(dv)
+    if keep.size == 0:
+        return out
+    out[:, keep] = dv[:, keep]
+    gain = np.hstack([cw_stm(n, horizon - k * h) @ _B for k in keep])
+    resid = (target - cw_stm(n, horizon) @ x0
+             - gain @ out[:, keep].reshape(-1, order="F"))
+    corr = np.linalg.lstsq(gain, resid, rcond=None)[0]
+    out[:, keep] += corr.reshape(3, -1, order="F")
+    return out
+
+
 def _finalize_plan(
     chief: CircularOrbit,
     satellites: list[Satellite],
@@ -314,10 +487,25 @@ def _finalize_plan(
     slack_max: float,
     iters: int,
     converged: bool,
+    polish: bool = False,
 ) -> RecoveryPlan:
-    """Extract discrete burns from the node grid, then score the plan."""
+    """Extract discrete burns from the node grid, then score the plan.
+
+    polish : re-target each controlled satellite's kept burns onto its
+        assigned slot after dropping sub-burn_floor impulses (see
+        `_polish_burns`). Satellites with no burns are left untouched.
+    """
     n_steps = dv_arrays[0].shape[1] - 1
     dt = (tf - t_delay) / n_steps
+
+    if polish:
+        n = chief.mean_motion
+        x_delay = _states_at_delay(n, satellites, t_delay)
+        dv_arrays = [
+            _polish_burns(n, x_delay[i], satellites[assignment[i]].x0,
+                          dv_arrays[i], tf - t_delay, cfg.burn_floor)
+            for i in range(len(satellites))
+        ]
 
     burns: dict[str, list[tuple[float, np.ndarray]]] = {}
     for i, sat in enumerate(satellites):
@@ -405,6 +593,8 @@ def plan_recovery(
     n_assignments: int | None = None,
     verbose: bool = False,
     allow_reslot: bool = True,
+    initial_guess: InitialGuess = ballistic_guess,
+    collision_avoidance: bool = True,
 ) -> RecoveryPlan:
     """Plan the minimum-cost multi-satellite recovery via SCP.
 
@@ -422,6 +612,18 @@ def plan_recovery(
     allow_reslot : if False, every satellite must return to its own slot
         (identity assignment only), which matches the single-satellite
         baselines' problem.
+    initial_guess : per-satellite function giving the burns that define the
+        first KOZ linearization, with signature
+        ``guess(n, x0, x_target, horizon, n_steps) -> dv (3, n_steps + 1)``.
+        Defaults to `ballistic_guess` (no burns); `two_impulse_guess` uses
+        the closed-form CW two-impulse transfer to the assigned slot;
+        `convex_guess` uses the keep-out-free fuel optimum (bind dv_max /
+        fuel_max with functools.partial).
+    collision_avoidance : if False, drop the keep-out constraints. The
+        problem is then convex and solved once per (assignment, tf): the
+        same grid, dynamics, objective and burn limits as the SCP, so it is
+        the fuel lower bound for the SCP at the same settings. The kept
+        burns are polished onto the slots (see `_polish_burns`).
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
@@ -443,7 +645,7 @@ def plan_recovery(
                 print(f"  tf={tf_c / 60:.1f} min, assignment {perm}:")
             res = _solve_fixed_assignment(
                 n, x_delay, [slots[perm[i]] for i in range(len(satellites))],
-                horizon, cfg, verbose,
+                horizon, cfg, verbose, initial_guess, collision_avoidance,
             )
             if res is None:
                 if verbose:
@@ -453,6 +655,7 @@ def plan_recovery(
             plan = _finalize_plan(
                 chief_orbit, satellites, dv_arrays, perm, t_delay, tf_c,
                 cfg, slack_max, iters, converged,
+                polish=not collision_avoidance,
             )
             if verbose:
                 print(f"    -> {plan.summary()}")
@@ -493,6 +696,61 @@ def baseline_two_impulse_plan(
     return _finalize_plan(
         chief_orbit, satellites, dv_arrays, tuple(range(n_sat)),
         t_delay, tf, cfg, slack_max=0.0, iters=0, converged=True,
+    )
+
+
+def baseline_convex_plan(
+    chief_orbit: CircularOrbit,
+    satellites: list[Satellite],
+    perturbed: str,
+    t_delay: float,
+    tf: float,
+    config: ScpConfig | None = None,
+    dt: float | None = None,
+) -> RecoveryPlan:
+    """Baseline controller: fuel-optimal convex return of ONLY the perturbed
+    satellite to its original slot (no re-slotting, no collision avoidance).
+
+    Minimizes sum_k ||dv_k||_2 over impulses on a uniform grid of nodes
+    t_k in [t_delay, tf], subject to the per-burn limit config.dv_max and the
+    budget config.fuel_max. The states are eliminated (condensed form):
+
+        x(tf) = Phi(tf - t_delay) x(t_delay)
+                + sum_k Phi(tf - t_k) B dv_k  ==  slot
+
+    so the SOCP has only 3 (N + 1) variables and 6 equality rows (see
+    `_solve_convex_transfer`). This is the SCP subproblem without the
+    keep-out constraints, restricted to one satellite, so it is the lower
+    bound the SCP is measured against. The cost converges to the
+    continuous-time optimum from above as dt -> 0.
+
+    dt : grid spacing [s]; defaults to config.dt (the SCP grid).
+    """
+    cfg = config or ScpConfig()
+    n = chief_orbit.mean_motion
+    names = [s.name for s in satellites]
+    idx = names.index(perturbed)
+    sat = satellites[idx]
+
+    horizon = tf - t_delay
+    if horizon <= 0:
+        raise ValueError("tf must exceed t_delay")
+    n_steps = max(2, int(round(horizon / (dt or cfg.dt))))
+
+    x_delay = _states_at_delay(n, satellites, t_delay)[idx]
+    dv, status = _solve_convex_transfer(
+        n, x_delay, sat.x0, horizon, n_steps,
+        cfg.dv_max, cfg.fuel_max, cfg.solver,
+    )
+    if dv is None:
+        raise RuntimeError(f"convex baseline {status}")
+
+    dv_arrays = [np.zeros((3, n_steps + 1)) for _ in satellites]
+    dv_arrays[idx] = dv
+    return _finalize_plan(
+        chief_orbit, satellites, dv_arrays, tuple(range(len(satellites))),
+        t_delay, tf, cfg, slack_max=0.0, iters=1,
+        converged=status == "optimal", polish=True,
     )
 
 

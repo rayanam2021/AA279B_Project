@@ -8,9 +8,14 @@ Figures (saved next to the first CSV unless --out is given):
                           coloured by reaction delay; points below the diagonal
                           mean method B is cheaper
 
+Each sweep is labelled from its filename, sweep_<label>_<date>_<time>.csv,
+so two configurations of the same method (e.g. sweep_scp_*.csv and
+sweep_scp_two_imp_*.csv, both method=scp) are kept apart. Override with --labels.
+
 Run:
-    python my_trade_studies/plot_sweep_comparison.py                      # latest CSV per method
+    python my_trade_studies/plot_sweep_comparison.py                      # latest CSV per label
     python my_trade_studies/plot_sweep_comparison.py A.csv B.csv --theta 90
+    python my_trade_studies/plot_sweep_comparison.py A.csv B.csv --labels ballistic two-impulse
 """
 import argparse
 from pathlib import Path
@@ -34,13 +39,17 @@ plt.rcParams.update({
 })
 
 
+def sweep_label(path: Path) -> str:
+    """Label from a sweep filename: sweep_<label>_<date>_<time>.csv -> <label>."""
+    return path.stem.removeprefix("sweep_").rsplit("_", 2)[0]
+
+
 def latest_per_method() -> list[Path]:
-    """Most recent sweep_<method>_<stamp>.csv for each method, oldest method first."""
+    """Most recent sweep_<label>_<stamp>.csv for each label, oldest label first."""
     latest = {}
     by_time = sorted(RESULTS_DIR.glob("sweep_*.csv"), key=lambda p: p.stem.rsplit("_", 2)[1:])
     for path in by_time:
-        method = path.stem.removeprefix("sweep_").rsplit("_", 2)[0]
-        latest[method] = path
+        latest[sweep_label(path)] = path
     return list(latest.values())
 
 
@@ -139,16 +148,23 @@ def main():
                         help="sweep CSVs (default: latest per method); the first two are compared")
     parser.add_argument("--theta", type=float, nargs="+", default=[90],
                         help="disturbance angles for the comparison plot [deg]")
+    parser.add_argument("--labels", nargs="+",
+                        help="names for the sweeps, one per CSV (default: from the filenames)")
     parser.add_argument("--out", type=Path, help="output directory for the figures")
     args = parser.parse_args()
 
     paths = args.csvs or latest_per_method()
+    if args.labels and len(args.labels) != len(paths):
+        parser.error(f"--labels needs {len(paths)} names, got {len(args.labels)}")
     sweeps = {}
-    for path in paths:
+    for i, path in enumerate(paths):
         r = load_sweep(path)
-        sweeps[str(r["method"][0])] = r
-        print(f"{path.name}: method={r['method'][0]}, {len(r['total_dv'])} cases, "
-              f"{np.sum(r['status'] != 'ok')} failed")
+        label = args.labels[i] if args.labels else sweep_label(path)
+        if label in sweeps:  # same label twice (e.g. two runs of one config)
+            label = f"{label} ({path.stem.split('_', 1)[1].rsplit('_', 2)[-2]})"
+        sweeps[label] = r
+        print(f"{path.name}: label={label}, method={r['method'][0]}, "
+              f"{len(r['total_dv'])} cases, {np.sum(r['status'] != 'ok')} failed")
     out_dir = args.out or paths[0].parent
     out_dir.mkdir(parents=True, exist_ok=True)
 

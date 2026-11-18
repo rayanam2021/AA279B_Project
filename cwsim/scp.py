@@ -74,14 +74,14 @@ class ScpConfig:
 
     dt: float = 90.0            # burn-grid spacing [s]
     dv_max: float = 10.0         # max impulse magnitude per burn [m/s]
-    fuel_max: float = 5.0       # per-satellite delta-v budget [m/s]
+    fuel_max: float = 0.0       # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
     n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)
     collision_margin: float = 0.0  # pad on d_min for inter-sample excursion [m]
-    w_balance: float = 0.1      # weight on max per-sat fuel (balancing)
+    w_balance: float = 0.0      # weight on max per-sat fuel (balancing)
     w_tf: float = 0.0           # weight on tf [m/s per s] for the tf trade
     w_slack: float = 1.0        # exact-penalty weight on collision slack [1/m]
-    max_iters: int = 8          # SCP iterations
+    max_iters: int = 100        # SCP iterations
     tol: float = 1e-3           # convergence: change in total dv [m/s]
     burn_floor: float = 1e-5    # discard solved burns smaller than this [m/s]
     check_dt: float = 10.0      # resolution of the post-solve collision check
@@ -183,12 +183,17 @@ def _solve_fixed_assignment(
     n_steps = max(2, int(round(horizon / cfg.dt)))
     dt = horizon / n_steps
     phi = cw_stm(n, dt)
-    n_sub = max(1, cfg.n_sub)
+
+    # We want to evaluate the KOZ at multiple times for each dt, make a phi to do that
+    n_subsamples = max(1, cfg.n_sub)
     # Position rows of the STM at each sub-sample time tau = (j+1) dt / n_sub:
     # r(t_k + tau) = S_j (x_k + B dv_k), affine in the decision variables.
-    sub_S = [cw_stm(n, (j + 1) * dt / n_sub)[:3, :] for j in range(n_sub)]
+    phi_pos_subsample = [cw_stm(n, (j + 1) * dt / n_subsamples)[:3, :] for j in range(n_subsamples)]
+
+    # min koz dist
     d_req = cfg.d_min + cfg.collision_margin
 
+    # TODO: switch to CW
     # Reference post-burn states at each node for the first linearization:
     # ballistic coast (no burns).
     ref = np.empty((n_sat, n_steps + 1, 6))
@@ -203,43 +208,55 @@ def _solve_fixed_assignment(
     for it in range(cfg.max_iters):
         dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
         x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
-        slack = cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
+
+        # KOZ slack per step & subsampled point
+        slack = cp.Variable((len(pairs), n_steps * n_subsamples), nonneg=True)
         fuel_cap = cp.Variable(nonneg=True)
         # Post-burn state at each node, affine in (x, dv).
         post = [x[i] + _B @ dv[i] for i in range(n_sat)]
 
-        cons = []
+        constraints = []
         fuels = []
         for i in range(n_sat):
-            cons.append(x[i][:, 0] == x_delay[i])
+            # Initial x0
+            constraints.append(x[i][:, 0] == x_delay[i])
+            # Dynamics
             for k in range(n_steps):
-                cons.append(x[i][:, k + 1] == phi @ post[i][:, k])
-            cons.append(
+                constraints.append(x[i][:, k + 1] == phi @ post[i][:, k])
+            # Final x/slot assignment
+            constraints.append(
                 x[i][:, n_steps] + _B @ dv[i][:, n_steps]
                 == slots_assigned[i]
             )
+
+            # Max dv per step
             norms = cp.hstack(
                 [cp.norm(dv[i][:, k]) for k in range(n_steps + 1)]
             )
-            cons.append(norms <= cfg.dv_max)
+            constraints.append(norms <= cfg.dv_max)
+
+            # Total satellite fuel consumption
             fuel_i = cp.sum(norms)
-            cons.append(fuel_i <= cfg.fuel_max)
-            cons.append(fuel_i <= fuel_cap)
+            constraints.append(fuel_i <= cfg.fuel_max)
+            constraints.append(fuel_i <= fuel_cap)
             fuels.append(fuel_i)
 
         # Linearized keep-out spheres (supporting halfspace => conservative),
         # enforced at every sub-sample time of every coast segment: the
         # samples tau = (j+1) dt / n_sub of segment k tile (t_d, t_f].
-        for p, (i, j) in enumerate(pairs):
+        for p_idx, (sat_idxi, sat_idxj) in enumerate(pairs):
             for k in range(n_steps):
-                for jj, S in enumerate(sub_S):
-                    d = S @ ref[i, k] - S @ ref[j, k]
+                for sub_samp_idx, phi_pos in enumerate(phi_pos_subsample):
+                    # distance of sat i from sat j at this subsample of this step
+                    d = phi_pos @ ref[sat_idxi, k] - phi_pos @ ref[sat_idxj, k]
                     nrm = np.linalg.norm(d)
+                    # vector pointing towards sat i from j
                     nhat = d / nrm if nrm > 1e-9 else np.array([0.0, 1.0, 0.0])
-                    a = nhat @ S  # row vector: maps post-burn state -> n.r
-                    cons.append(
-                        a @ (post[i][:, k] - post[j][:, k])
-                        >= d_req - slack[p, k * n_sub + jj]
+                    a = nhat @ phi_pos  # row vector: maps post-burn state -> n.r
+                    # constrain the distance between the two in the nhat direction to be larger than limit
+                    constraints.append(
+                        a @ (post[sat_idxi][:, k] - post[sat_idxj][:, k])
+                        >= d_req - slack[p_idx, k * n_subsamples + sub_samp_idx]
                     )
 
         obj = (
@@ -247,13 +264,14 @@ def _solve_fixed_assignment(
             + cfg.w_balance * fuel_cap
             + cfg.w_slack * cp.sum(slack)
         )
-        prob = cp.Problem(cp.Minimize(obj), cons)
+        prob = cp.Problem(cp.Minimize(obj), constraints)
         try:
             prob.solve(solver=cfg.solver)
         except cp.SolverError:
             return None
         if prob.status not in ("optimal", "optimal_inaccurate"):
             return None
+
 
         total = sum(
             float(np.linalg.norm(dv[i].value[:, k]))
@@ -272,8 +290,9 @@ def _solve_fixed_assignment(
         if converged:
             break
         prev_total = total
+
         for i in range(n_sat):
-            # Re-linearize about the new iterate's post-burn states.
+            # Re-linearize about the new iterate's post-burn states for the KOZ
             ref[i] = (x[i].value + _B @ dv[i].value).T
 
     return result
@@ -379,7 +398,7 @@ def plan_recovery(
     tf: float | list[float],
     config: ScpConfig | None = None,
     slots: list[np.ndarray] | None = None,
-    n_assignments: int = 3,
+    n_assignments: int = -1,
     verbose: bool = False,
     allow_reslot: bool = True,
 ) -> RecoveryPlan:

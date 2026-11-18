@@ -59,17 +59,9 @@ chief = CircularOrbit(
 )
 
 cfg = ScpConfig(
-    dt=300.0,
-    dv_max=1e3,
-    fuel_max=1e6,
+    dv_max=0,
+    fuel_max=0,
     d_min=200.0,
-    collision_margin=10.0,
-    enforce_collision=False,
-    w_balance=0.0,
-    w_tf=0.0,
-    burn_floor=0.0,
-    max_iters=100,
-    check_dt=CHECK_DT,
 )
 
 tf = TF_ORBITS * chief.period

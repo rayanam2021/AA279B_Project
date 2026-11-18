@@ -13,10 +13,13 @@ and slack for the closed-form baselines) keep the values the plan reports.
 
 Run:
     python my_trade_studies/configurable_scp_sweep.py --method scp
-    python my_trade_studies/configurable_scp_sweep.py --method cw --limit 5 --serial
+    python my_trade_studies/configurable_scp_sweep.py --method cw --limit 5 --debug
+    python my_trade_studies/configurable_scp_sweep.py --method scp --resume results/sweep_scp_<stamp>.csv
 
 Output: results/sweep_<method>_<timestamp>.csv plus a .json sidecar with the
-settings used.
+settings used. Rows are appended as cases finish, so an interrupted sweep can be
+continued with --resume (cases already in the CSV, including errors, are skipped).
+On macOS the sweep runs under `caffeinate` so the machine doesn't sleep mid-run.
 """
 import argparse
 import csv
@@ -24,8 +27,10 @@ import itertools
 import json
 import math
 import os
+import subprocess
 import sys
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
@@ -35,6 +40,11 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_var] = "1"  # one BLAS thread per worker process
 
 import numpy as np
+from tqdm import tqdm
+
+# cvxpy warns on every 'optimal_inaccurate' solve (which the planners accept);
+# from the worker processes it would break up the progress bar.
+warnings.filterwarnings("ignore", message="Solution may be inaccurate")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cvxpy as cp  # noqa: E402
@@ -54,8 +64,8 @@ from cwsim.scp import (  # noqa: E402
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # ============================ sweep settings ============================
-THETA_DEG = list(range(0, 360, 10))        # 0 = radial, 90 = along-track
-DV_MAG = [0.05, 0.10, 0.15, 0.20]          # disturbance magnitude [m/s]
+THETA_DEG = list(range(0, 90, 10))        # 0 = radial, 90 = along-track
+DV_MAG = [0.10] # [0.05, 0.10, 0.15, 0.20]          # disturbance magnitude [m/s]
 DELAY_ORBITS = [0.10, 0.25, 0.50, 0.75, 1.00]
 RECOVERY_ORBITS = 2.15                     # tf - t_delay [orbits]; not a round number (CW singularity)
 SPACING_M = 1000.0
@@ -262,40 +272,69 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         help="run in this process (for debugging / breakpoints)")
     parser.add_argument("--out", type=Path, help="output CSV path")
+    parser.add_argument("--resume", type=Path, metavar="CSV",
+                        help="append to an existing sweep CSV, skipping cases already in it")
     args = parser.parse_args()
 
     cases = list(itertools.product(THETA_DEG, DV_MAG, DELAY_ORBITS))
     if args.limit:
         cases = cases[:args.limit]
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = args.out or RESULTS_DIR / f"sweep_{args.method}_{stamp}.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.with_suffix(".json").write_text(json.dumps(dict(
-        method=args.method, theta_deg=THETA_DEG, dv_mag=DV_MAG, delay_orbits=DELAY_ORBITS,
-        recovery_orbits=RECOVERY_ORBITS, spacing_m=SPACING_M, n_sats=N_SATS,
-        perturbed=PERTURBED, config=asdict(CONFIG)), indent=2))
+    if args.resume:
+        out = args.resume
+        with out.open(newline="") as f:
+            done_rows = list(csv.DictReader(f))
+        methods = {r["method"] for r in done_rows}
+        if methods - {args.method}:
+            parser.error(f"{out} holds method(s) {methods}, not {args.method!r}")
+        done = {(float(r["theta_deg"]), float(r["dv_mag"]), float(r["delay_orbits"]))
+                for r in done_rows}
+        cases = [c for c in cases if tuple(map(float, c)) not in done]
+        print(f"Resuming {out}: {len(done)} cases done, {len(cases)} to run", flush=True)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = args.out or RESULTS_DIR / f"sweep_{args.method}_{stamp}.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.with_suffix(".json").write_text(json.dumps(dict(
+            method=args.method, theta_deg=THETA_DEG, dv_mag=DV_MAG, delay_orbits=DELAY_ORBITS,
+            recovery_orbits=RECOVERY_ORBITS, spacing_m=SPACING_M, n_sats=N_SATS,
+            perturbed=PERTURBED, config=asdict(CONFIG)), indent=2))
     print(f"{len(cases)} cases, method={args.method} -> {out}", flush=True)
 
-    with out.open("x", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS, restval="")
-        writer.writeheader()
+    if sys.platform == "darwin":  # keep the Mac awake until this process exits
+        subprocess.Popen(["caffeinate", "-is", "-w", str(os.getpid())])
+        print("caffeinate on: system sleep blocked while the sweep runs", flush=True)
 
-        def record(i, row):
+    with out.open("a" if args.resume else "x", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS, restval="")
+        if not args.resume:
+            writer.writeheader()
+
+        # Progress bar: done/total, elapsed<remaining (ETA) and s/case.
+        bar = tqdm(total=len(cases), unit="case", dynamic_ncols=True, smoothing=0.1)
+        n_failed = 0
+
+        def record(row):
+            nonlocal n_failed
             writer.writerow(row)
             f.flush()
-            print(f"[{i}/{len(cases)}] theta={row['theta_deg']:>5} dv={row['dv_mag']:.2f} "
-                  f"delay={row['delay_orbits']:.2f}: {row['status']} "
-                  f"total_dv={row.get('total_dv', float('nan')):.4f} {row['error']}", flush=True)
+            n_failed += row["status"] != "ok"
+            bar.write(f"theta={row['theta_deg']:>5} dv={row['dv_mag']:.2f} "
+                      f"delay={row['delay_orbits']:.2f}: {row['status']} "
+                      f"total_dv={row.get('total_dv', float('nan')):.4f} "
+                      f"({row['runtime_s']:.0f} s) {row['error']}")
+            bar.set_postfix(failed=n_failed)
+            bar.update()
 
-        if args.debug:
-            for i, case in enumerate(cases, 1):
-                record(i, run_case(args.method, *case))
-        else:
-            with ProcessPoolExecutor(max_workers=args.workers) as pool:
-                futures = [pool.submit(run_case, args.method, *case) for case in cases]
-                for i, future in enumerate(as_completed(futures), 1):
-                    record(i, future.result())
+        with bar:
+            if args.debug:
+                for case in cases:
+                    record(run_case(args.method, *case))
+            else:
+                with ProcessPoolExecutor(max_workers=args.workers) as pool:
+                    futures = [pool.submit(run_case, args.method, *case) for case in cases]
+                    for future in as_completed(futures):
+                        record(future.result())
     print(f"Done: {out}", flush=True)
 
 

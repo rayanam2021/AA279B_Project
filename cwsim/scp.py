@@ -81,7 +81,7 @@ class ScpConfig:
     w_balance: float = 0.0      # weight on max per-sat fuel (balancing)
     w_tf: float = 0.0           # weight on tf [m/s per s] for the tf trade
     w_slack: float = 1.0        # exact-penalty weight on collision slack [1/m]
-    max_iters: int = 100        # SCP iterations
+    max_iters: int = 50        # SCP iterations
     tol: float = 1e-3           # convergence: change in total dv [m/s]
     burn_floor: float = 1e-5    # discard solved burns smaller than this [m/s]
     check_dt: float = 10.0      # resolution of the post-solve collision check
@@ -202,69 +202,78 @@ def _solve_fixed_assignment(
             ref[i, k] = cw_stm(n, k * dt) @ x_delay[i]
 
     pairs = list(itertools.combinations(range(n_sat), 2))
+    n_cols = n_steps * n_subsamples  # one KOZ sample per (segment k, sub-sample j)
+    phi_pos = np.stack(phi_pos_subsample)  # (n_sub, 3, 6)
+    # (post @ repeat)[:, k * n_sub + j] == post[:, k]: copies each node's
+    # post-burn state to the columns of its sub-samples.
+    repeat = np.kron(np.eye(n_steps), np.ones((1, n_subsamples)))
+
+    # ---- Convex subproblem. Variables, dynamics, burn and fuel constraints
+    # are built once; only the KOZ linearisation is rebuilt each iteration.
+    # Every constraint is vectorised (a handful of cvxpy objects instead of
+    # thousands of scalar ones), which is what keeps compilation cheap.
+    # (A cp.Parameter/DPP version was tried: Clarabel failed numerically on
+    # KOZ-active cases, so the KOZ rows are plain constants.)
+    dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
+    x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
+    # KOZ slack per pair, per step & sub-sampled point
+    slack = cp.Variable((len(pairs), n_cols), nonneg=True)
+    fuel_cap = cp.Variable(nonneg=True)
+    # Post-burn state at each node, affine in (x, dv).
+    post = [x[i] + _B @ dv[i] for i in range(n_sat)]
+
+    constraints = []
+    fuels = []
+    for i in range(n_sat):
+        constraints += [
+            x[i][:, 0] == x_delay[i],                        # initial state
+            x[i][:, 1:] == phi @ post[i][:, :-1],            # CW dynamics
+            post[i][:, n_steps] == slots_assigned[i],        # final slot
+        ]
+        norms = cp.norm(dv[i], 2, axis=0)                    # |dv| per node
+        fuel_i = cp.sum(norms)
+        constraints += [
+            norms <= cfg.dv_max,                             # max dv per burn
+            fuel_i <= cfg.fuel_max,                          # fuel budget
+            fuel_i <= fuel_cap,                              # fuel balancing
+        ]
+        fuels.append(fuel_i)
+
+    obj = cp.Minimize(
+        cp.sum(cp.hstack(fuels))
+        + cfg.w_balance * fuel_cap
+        + cfg.w_slack * cp.sum(slack)
+    )
+    # Relative post-burn state of each pair, copied to every sub-sample column.
+    rel_post = [(post[i] - post[j])[:, :n_steps] @ repeat for i, j in pairs]
+
+    def koz_constraints(ref: np.ndarray) -> list:
+        """Linearized keep-out spheres (supporting halfspace => conservative)
+        about the reference post-burn states, enforced at every sub-sample
+        time of every coast segment: the samples tau = (j+1) dt / n_sub of
+        segment k tile (t_d, t_f]. Column k*n_sub + j of `rows` is the row
+        vector nhat^T S_j mapping the pair's relative post-burn state at
+        node k to n.r at that sample."""
+        out = []
+        for p_idx, (i, j) in enumerate(pairs):
+            # relative position of sat i from sat j at every (k, sub-sample)
+            rel = np.einsum("jcs,ks->kjc", phi_pos,
+                            ref[i, :n_steps] - ref[j, :n_steps])
+            nrm = np.linalg.norm(rel, axis=2)
+            nhat = np.zeros_like(rel)
+            nhat[..., 1] = 1.0  # fallback direction for coincident sats
+            ok = nrm > 1e-9
+            nhat[ok] = rel[ok] / nrm[ok, None]
+            rows = np.einsum("kjc,jcs->kjs", nhat, phi_pos).reshape(n_cols, 6).T
+            out.append(cp.sum(cp.multiply(rows, rel_post[p_idx]), axis=0)
+                       >= d_req - slack[p_idx])
+        return out
+
     prev_total = np.inf
     result = None
 
     for it in range(cfg.max_iters):
-        dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
-        x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
-
-        # KOZ slack per step & subsampled point
-        slack = cp.Variable((len(pairs), n_steps * n_subsamples), nonneg=True)
-        fuel_cap = cp.Variable(nonneg=True)
-        # Post-burn state at each node, affine in (x, dv).
-        post = [x[i] + _B @ dv[i] for i in range(n_sat)]
-
-        constraints = []
-        fuels = []
-        for i in range(n_sat):
-            # Initial x0
-            constraints.append(x[i][:, 0] == x_delay[i])
-            # Dynamics
-            for k in range(n_steps):
-                constraints.append(x[i][:, k + 1] == phi @ post[i][:, k])
-            # Final x/slot assignment
-            constraints.append(
-                x[i][:, n_steps] + _B @ dv[i][:, n_steps]
-                == slots_assigned[i]
-            )
-
-            # Max dv per step
-            norms = cp.hstack(
-                [cp.norm(dv[i][:, k]) for k in range(n_steps + 1)]
-            )
-            constraints.append(norms <= cfg.dv_max)
-
-            # Total satellite fuel consumption
-            fuel_i = cp.sum(norms)
-            constraints.append(fuel_i <= cfg.fuel_max)
-            constraints.append(fuel_i <= fuel_cap)
-            fuels.append(fuel_i)
-
-        # Linearized keep-out spheres (supporting halfspace => conservative),
-        # enforced at every sub-sample time of every coast segment: the
-        # samples tau = (j+1) dt / n_sub of segment k tile (t_d, t_f].
-        for p_idx, (sat_idxi, sat_idxj) in enumerate(pairs):
-            for k in range(n_steps):
-                for sub_samp_idx, phi_pos in enumerate(phi_pos_subsample):
-                    # distance of sat i from sat j at this subsample of this step
-                    d = phi_pos @ ref[sat_idxi, k] - phi_pos @ ref[sat_idxj, k]
-                    nrm = np.linalg.norm(d)
-                    # vector pointing towards sat i from j
-                    nhat = d / nrm if nrm > 1e-9 else np.array([0.0, 1.0, 0.0])
-                    a = nhat @ phi_pos  # row vector: maps post-burn state -> n.r
-                    # constrain the distance between the two in the nhat direction to be larger than limit
-                    constraints.append(
-                        a @ (post[sat_idxi][:, k] - post[sat_idxj][:, k])
-                        >= d_req - slack[p_idx, k * n_subsamples + sub_samp_idx]
-                    )
-
-        obj = (
-            cp.sum(cp.hstack(fuels))
-            + cfg.w_balance * fuel_cap
-            + cfg.w_slack * cp.sum(slack)
-        )
-        prob = cp.Problem(cp.Minimize(obj), constraints)
+        prob = cp.Problem(obj, constraints + koz_constraints(ref))
         try:
             prob.solve(solver=cfg.solver)
         except cp.SolverError:
@@ -272,12 +281,8 @@ def _solve_fixed_assignment(
         if prob.status not in ("optimal", "optimal_inaccurate"):
             return None
 
-
-        total = sum(
-            float(np.linalg.norm(dv[i].value[:, k]))
-            for i in range(n_sat)
-            for k in range(n_steps + 1)
-        )
+        total = float(sum(np.linalg.norm(dv[i].value, axis=0).sum()
+                          for i in range(n_sat)))
         slack_max = float(slack.value.max()) if slack.value.size else 0.0
         converged = abs(prev_total - total) < cfg.tol
         result = ([dv[i].value.copy() for i in range(n_sat)], total,

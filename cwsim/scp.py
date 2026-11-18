@@ -61,6 +61,7 @@ import numpy as np
 
 from .dynamics import cw_stm, cw_two_impulse, propagate_cw_with_impulses
 from .orbits import CircularOrbit
+from .roe import roe_impulsive_reconfig
 from .satellites import Satellite
 
 # Impulse input matrix: dv adds to the velocity half of the state.
@@ -72,7 +73,7 @@ class ScpConfig:
     """Tuning knobs for the SCP recovery planner (SI units)."""
 
     dt: float = 90.0            # burn-grid spacing [s]
-    dv_max: float = 0.5         # max impulse magnitude per burn [m/s]
+    dv_max: float = 10.0         # max impulse magnitude per burn [m/s]
     fuel_max: float = 5.0       # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
     n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)
@@ -83,9 +84,8 @@ class ScpConfig:
     max_iters: int = 8          # SCP iterations
     tol: float = 1e-3           # convergence: change in total dv [m/s]
     burn_floor: float = 1e-5    # discard solved burns smaller than this [m/s]
-    check_dt: float = 15.0      # resolution of the post-solve collision check
+    check_dt: float = 10.0      # resolution of the post-solve collision check
     solver: str = "CLARABEL"
-    enforce_collision: bool = True  # False for unconstrained baseline comparison
 
 
 @dataclass
@@ -203,8 +203,7 @@ def _solve_fixed_assignment(
     for it in range(cfg.max_iters):
         dv = [cp.Variable((3, n_steps + 1)) for _ in range(n_sat)]
         x = [cp.Variable((6, n_steps + 1)) for _ in range(n_sat)]
-        slack = (cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
-                 if cfg.enforce_collision else None)
+        slack = cp.Variable((len(pairs), n_steps * n_sub), nonneg=True)
         fuel_cap = cp.Variable(nonneg=True)
         # Post-burn state at each node, affine in (x, dv).
         post = [x[i] + _B @ dv[i] for i in range(n_sat)]
@@ -231,7 +230,7 @@ def _solve_fixed_assignment(
         # Linearized keep-out spheres (supporting halfspace => conservative),
         # enforced at every sub-sample time of every coast segment: the
         # samples tau = (j+1) dt / n_sub of segment k tile (t_d, t_f].
-        for p, (i, j) in enumerate(pairs if cfg.enforce_collision else []):
+        for p, (i, j) in enumerate(pairs):
             for k in range(n_steps):
                 for jj, S in enumerate(sub_S):
                     d = S @ ref[i, k] - S @ ref[j, k]
@@ -246,15 +245,11 @@ def _solve_fixed_assignment(
         obj = (
             cp.sum(cp.hstack(fuels))
             + cfg.w_balance * fuel_cap
-            + (cfg.w_slack * cp.sum(slack) if slack is not None else 0)
+            + cfg.w_slack * cp.sum(slack)
         )
         prob = cp.Problem(cp.Minimize(obj), cons)
         try:
-            # Avoid the C++ backend integer-ID limit in long sweeps.
-            prob.solve(
-                solver=cfg.solver,
-                canon_backend=cp.SCIPY_CANON_BACKEND,
-            )
+            prob.solve(solver=cfg.solver)
         except cp.SolverError:
             return None
         if prob.status not in ("optimal", "optimal_inaccurate"):
@@ -265,8 +260,7 @@ def _solve_fixed_assignment(
             for i in range(n_sat)
             for k in range(n_steps + 1)
         )
-        slack_max = (float(slack.value.max()) if slack is not None
-                     and slack.value is not None and slack.value.size else 0.0)
+        slack_max = float(slack.value.max()) if slack.value.size else 0.0
         converged = abs(prev_total - total) < cfg.tol
         result = ([dv[i].value.copy() for i in range(n_sat)], total,
                   slack_max, it + 1, converged)
@@ -297,21 +291,46 @@ def _finalize_plan(
     iters: int,
     converged: bool,
 ) -> RecoveryPlan:
-    """Extract discrete burns, re-propagate finely, and score the plan."""
-    n = chief.mean_motion
+    """Extract discrete burns from the node grid, then score the plan."""
     n_steps = dv_arrays[0].shape[1] - 1
     dt = (tf - t_delay) / n_steps
 
     burns: dict[str, list[tuple[float, np.ndarray]]] = {}
-    per_sat_dv: dict[str, float] = {}
     for i, sat in enumerate(satellites):
-        sat_burns = []
-        for k in range(n_steps + 1):
-            dv = dv_arrays[i][:, k]
-            if np.linalg.norm(dv) >= cfg.burn_floor:
-                sat_burns.append((t_delay + k * dt, dv.copy()))
-        burns[sat.name] = sat_burns
-        per_sat_dv[sat.name] = sum(np.linalg.norm(d) for _, d in sat_burns)
+        burns[sat.name] = [
+            (t_delay + k * dt, dv_arrays[i][:, k].copy())
+            for k in range(n_steps + 1)
+        ]
+    return _score_burns(
+        chief, satellites, burns, assignment, t_delay, tf, cfg,
+        slack_max, iters, converged,
+    )
+
+
+def _score_burns(
+    chief: CircularOrbit,
+    satellites: list[Satellite],
+    burns: dict[str, list[tuple[float, np.ndarray]]],
+    assignment: tuple[int, ...],
+    t_delay: float,
+    tf: float,
+    cfg: ScpConfig,
+    slack_max: float,
+    iters: int,
+    converged: bool,
+) -> RecoveryPlan:
+    """Drop negligible burns, re-propagate finely, and score the plan.
+
+    Burns may sit at arbitrary times in [t_delay, tf], not only on a grid.
+    """
+    n = chief.mean_motion
+    per_sat_dv: dict[str, float] = {}
+    for sat in satellites:
+        kept = [(t, np.asarray(dv, dtype=float))
+                for t, dv in burns.get(sat.name, [])
+                if np.linalg.norm(dv) >= cfg.burn_floor]
+        burns[sat.name] = kept
+        per_sat_dv[sat.name] = sum(np.linalg.norm(d) for _, d in kept)
     total_dv = sum(per_sat_dv.values())
 
     # Fine re-propagation (existing impulses + planned burns) and separation
@@ -362,7 +381,7 @@ def plan_recovery(
     slots: list[np.ndarray] | None = None,
     n_assignments: int = 3,
     verbose: bool = False,
-    fixed_assignment: tuple[int, ...] | None = None,
+    allow_reslot: bool = True,
 ) -> RecoveryPlan:
     """Plan the minimum-cost multi-satellite recovery via SCP.
 
@@ -380,7 +399,9 @@ def plan_recovery(
         satellites over these slots is allowed.
     n_assignments : how many of the heuristically-ranked slot permutations
         to solve exactly.
-    fixed_assignment : exact satellite-to-slot mapping; disables reordering.
+    allow_reslot : if False, every satellite must return to its own slot
+        (identity assignment only), which matches the single-satellite
+        baselines' problem.
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
@@ -394,14 +415,11 @@ def plan_recovery(
         if horizon <= 0:
             raise ValueError("tf must exceed t_delay")
         x_delay = _states_at_delay(n, satellites, t_delay)
-        if fixed_assignment is not None:
-            perm = tuple(fixed_assignment)
-            if sorted(perm) != list(range(len(satellites))):
-                raise ValueError("fixed_assignment must be a permutation")
-            permutations = [perm]
-        else:
-            permutations = _rank_assignments(n, x_delay, slots, horizon, n_assignments)
-        for perm in permutations:
+        perms = (
+            _rank_assignments(n, x_delay, slots, horizon, n_assignments)
+            if allow_reslot else [tuple(range(len(satellites)))]
+        )
+        for perm in perms:
             if verbose:
                 print(f"  tf={tf_c / 60:.1f} min, assignment {perm}:")
             res = _solve_fixed_assignment(
@@ -455,5 +473,45 @@ def baseline_two_impulse_plan(
     dv_arrays[idx][:, 1] = dv2
     return _finalize_plan(
         chief_orbit, satellites, dv_arrays, tuple(range(n_sat)),
+        t_delay, tf, cfg, slack_max=0.0, iters=0, converged=True,
+    )
+
+
+def baseline_roe_plan(
+    chief_orbit: CircularOrbit,
+    satellites: list[Satellite],
+    perturbed: str,
+    t_delay: float,
+    tf: float,
+    config: ScpConfig | None = None,
+    candidates: str = "augmented",
+) -> RecoveryPlan:
+    """Baseline controller: Chernick & D'Amico closed-form ROE reconfiguration
+    of ONLY the perturbed satellite back to its original slot (no
+    re-slotting, no collision avoidance).
+
+    Same interface as `baseline_two_impulse_plan`, but the burn times and
+    count come from `cwsim.roe.roe_impulsive_reconfig` (tangential in-plane
+    triplets plus one cross-track burn) rather than being fixed at t_delay
+    and tf. Raises `cwsim.roe.ClosedFormUnavailable` if tf - t_delay is too
+    short for the closed-form scheme.
+    """
+    cfg = config or ScpConfig()
+    n = chief_orbit.mean_motion
+    names = [s.name for s in satellites]
+    idx = names.index(perturbed)
+    sat = satellites[idx]
+
+    x_delay = _states_at_delay(n, satellites, t_delay)[idx]
+    # u0 only rotates the ROE vectors; pass the true argument of latitude so
+    # plan.pseudo_state is physically meaningful.
+    u0 = chief_orbit.arg_lat0 + n * t_delay
+    roe_plan = roe_impulsive_reconfig(
+        x_delay, n, tf - t_delay, sat.x0, u0=u0, candidates=candidates
+    )
+    burns = {s.name: [] for s in satellites}
+    burns[perturbed] = [(t_delay + t, dv) for t, dv in roe_plan.burns]
+    return _score_burns(
+        chief_orbit, satellites, burns, tuple(range(len(satellites))),
         t_delay, tf, cfg, slack_max=0.0, iters=0, converged=True,
     )

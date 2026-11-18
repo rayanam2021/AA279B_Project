@@ -68,7 +68,7 @@ cfg = ScpConfig(
     w_balance=0.0,
     w_tf=0.0,
     burn_floor=0.0,
-    max_iters=2,
+    max_iters=100,
     check_dt=CHECK_DT,
 )
 
@@ -343,7 +343,7 @@ def run_case(case):
                 t_delay,
                 tf,
                 cfg,
-                fixed_assignment=tuple(range(len(sats)))
+                allow_reslot=False
             )
 
             if PRINT_SATELLITE_DV:

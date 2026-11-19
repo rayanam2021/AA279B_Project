@@ -63,7 +63,7 @@ from cwsim.scp import (  # noqa: E402
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 # ============================ sweep settings ============================
-THETA_DEG = list(range(0, 180, 10))        # 0 = radial, 90 = along-track
+THETA_DEG = list(range(0, 190, 10))        # 0 = radial, 90 = along-track
 DV_MAG = [0.05, 0.10, 0.15, 0.20]          # disturbance magnitude [m/s]
 DELAY_ORBITS = [0.10, 0.25, 0.50, 0.75, 1.00]
 RECOVERY_ORBITS = 2.15                     # tf - t_delay [orbits]; not a round number (CW singularity)
@@ -77,7 +77,7 @@ CONFIG = ScpConfig(
     d_min=200.0,          # keep-out radius [m]
     w_balance=0.0,
 )
-METHOD = "scp_convex"            # default planner; override with --method
+METHOD = "cw"            # default planner; override with --method
 # ========================================================================
 
 
@@ -93,7 +93,7 @@ def scp(chief, sats, td, tf):
 
 
 def scp_reslot(chief, sats, td, tf):
-    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True, initial_guess=convex_guess)
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True, initial_guess=ballistic_guess)
 
 
 def convex(chief, sats, td, tf):

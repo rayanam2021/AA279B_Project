@@ -1,5 +1,5 @@
 {
-  "method": "scp_reslot",
+  "method": "scp_reslot_convex",
   "theta_deg": [
     0,
     10,
@@ -43,7 +43,7 @@
     "fuel_max": 1000000.0,
     "d_min": 200.0,
     "n_sub": 6,
-    "collision_margin": 0.0,
+    "collision_margin": 0.5,
     "w_balance": 0.0,
     "w_tf": 0.0,
     "w_slack": 1.0,

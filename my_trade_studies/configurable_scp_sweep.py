@@ -93,7 +93,7 @@ def scp(chief, sats, td, tf):
 
 
 def scp_reslot(chief, sats, td, tf):
-    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True, initial_guess=ballistic_guess)
+    return plan_recovery(chief, sats, td, tf, CONFIG, allow_reslot=True, initial_guess=convex_guess)
 
 
 def convex(chief, sats, td, tf):

@@ -81,7 +81,6 @@ for limit in (6, 30):
         delay * chief.period,
         2.15 * chief.period,
         cfg,
-        n_assignments=2,
         verbose=True,
     )
 

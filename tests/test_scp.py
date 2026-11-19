@@ -33,7 +33,7 @@ def test_scp_restores_formation() -> None:
     t_delay = 0.25 * chief.period
     tf = 1.6 * chief.period
     cfg = ScpConfig(dt=120.0, n_sub=6, collision_margin=25.0, d_min=200.0)
-    plan = plan_recovery(chief, sats, t_delay, tf, cfg, n_assignments=2)
+    plan = plan_recovery(chief, sats, t_delay, tf, cfg)
     print(f"plan: {plan.summary()}")
 
     # Propagate each satellite (perturbation + planned burns) to tf and a
@@ -139,8 +139,60 @@ def test_scp_controlled_only_moves_perturbed() -> None:
     assert reslot.burns["Sat-1"] == [] and reslot.burns["Sat-3"] == []
 
 
+def test_assignment_pruning_matches_exhaustive() -> None:
+    """Branch-and-bound assignment pruning returns the same plan as solving
+    the SCP for every slot permutation, with far fewer SCP solves."""
+    import cwsim.scp as scp
+
+    chief = CircularOrbit(altitude=550e3, inclination=np.radians(51.6))
+    # Sweep-style cases (configurable_scp_sweep.py grid), drawn with a fixed
+    # seed; a coarser grid keeps the test quick.
+    grid = list(itertools.product(range(0, 180, 10), [0.05, 0.10, 0.15, 0.20],
+                                  [0.10, 0.25, 0.50, 0.75, 1.00]))
+    rng = np.random.default_rng(0)
+    cases = [grid[i] for i in rng.choice(len(grid), 20, replace=False)]
+    cfg = ScpConfig(dt=180.0, n_sub=6, dv_max=1000.0, fuel_max=1e6,
+                    d_min=200.0, collision_margin=0.5)
+
+    calls = {"n": 0}
+    orig = scp._solve_fixed_assignment
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    scp._solve_fixed_assignment = counted
+    solves = {True: 0, False: 0}
+    try:
+        for theta, mag, delay in cases:
+            plans = {}
+            for prune in (False, True):
+                sats = along_track_formation(spacing=1000.0, count=3)
+                th = np.radians(theta)
+                sats[1].add_impulse(0.0, mag * np.array([np.cos(th), np.sin(th), 0.0]))
+                t_delay = delay * chief.period
+                calls["n"] = 0
+                plans[prune] = plan_recovery(
+                    chief, sats, t_delay, t_delay + 2.15 * chief.period, cfg,
+                    initial_guess=convex_guess, prune=prune)
+                solves[prune] += calls["n"]
+            full, pruned = plans[False], plans[True]
+            # Same KOZ status, and pruning never does worse (ties within the
+            # SCP's relative convergence tolerance may pick either slot).
+            assert ((full.min_sep_recovery >= cfg.d_min)
+                    == (pruned.min_sep_recovery >= cfg.d_min)), (theta, mag, delay)
+            assert pruned.objective <= full.objective * (1 + cfg.tol) + 1e-9, (
+                theta, mag, delay, full.summary(), pruned.summary())
+    finally:
+        scp._solve_fixed_assignment = orig
+    assert solves[True] < solves[False]
+    print(f"pruning matches exhaustive on {len(cases)} cases; SCP solves "
+          f"{solves[True]} vs {solves[False]}:  PASS")
+
+
 if __name__ == "__main__":
     test_scp_restores_formation()
     test_baseline_convex_plan()
     test_scp_controlled_only_moves_perturbed()
+    test_assignment_pruning_matches_exhaustive()
     print("\nSCP test passed.")

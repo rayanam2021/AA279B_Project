@@ -77,7 +77,7 @@ CONFIG = ScpConfig(
     d_min=200.0,          # keep-out radius [m]
     w_balance=0.0,
 )
-METHOD = "scp_reslot"            # default planner; override with --method
+METHOD = "scp_reslot_convex"            # default planner; override with --method
 # ========================================================================
 
 

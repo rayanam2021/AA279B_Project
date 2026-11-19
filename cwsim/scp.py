@@ -49,8 +49,23 @@ at no change in problem class. An optional collision_margin pads d_min to
 cover the residual excursion between sub-samples, and a fine-grained
 post-check reports the true minimum separation of the executed plan.
 
-Slot assignment: the 3! (n!) slot permutations are ranked with a cheap
-closed-form two-impulse cost heuristic and the best few are solved exactly.
+Slot assignment (branch and bound): dropping the keep-out constraint
+decouples the satellites, so the keep-out-free cost of EVERY slot permutation
+follows exactly from an n x n matrix of single-satellite minimum-fuel
+transfers (one small SOCP each, same grid / burn limits as the SCP):
+
+    LB(sigma) = sum_i c[i, sigma(i)] + w_balance * max_i c[i, sigma(i)]
+                + w_tf * tf
+
+Removing a constraint can only lower the optimum, so LB(sigma) is a lower
+bound on what sigma can achieve with the keep-out. Assignments (and tf
+candidates) are visited in increasing LB order:
+  * if sigma's keep-out-free optimum already clears the keep-out, it is the
+    exact optimum for sigma and the SCP is skipped;
+  * otherwise the SCP is solved for sigma;
+  * the search stops once the next LB is no better than the best
+    keep-out-compliant plan found, since no remaining assignment can beat it.
+An infeasible keep-out-free transfer (dv_max / fuel_max) rules sigma out.
 """
 
 from __future__ import annotations
@@ -221,7 +236,7 @@ class ScpConfig:
     fuel_max: float = np.inf    # per-satellite delta-v budget [m/s]
     d_min: float = 200.0        # pairwise keep-out radius [m]
     n_sub: int = 6              # keep-out samples per segment (every dt/n_sub)
-    collision_margin: float = 0.0  # pad on d_min for inter-sample excursion [m]
+    collision_margin: float = 0.5  # pad on d_min for inter-sample excursion [m]
     w_balance: float = 0.0      # weight on max per-sat fuel (balancing)
     w_tf: float = 0.0           # weight on tf [m/s per s] for the tf trade
     w_slack: float = 1.0        # exact-penalty weight on collision slack [1/m]
@@ -242,13 +257,17 @@ class RecoveryPlan:
     per_sat_dv: dict[str, float]
     tf: float
     t_delay: float
-    objective: float                  # total_dv + w_tf*tf (+ slack penalty)
+    objective: float                  # total_dv + w_balance*max per-sat dv
+                                      # + w_tf*tf + w_slack*slack_max
     min_separation: float             # fine-grid min pairwise distance [m]
     slack_max: float                  # residual linearized violation [m]
     iterations: int
     converged: bool
     times: np.ndarray                 # fine time grid for the trajectories
     trajectories: dict[str, np.ndarray]  # name -> (M, 6) LVLH states
+    # min pairwise distance for t >= t_delay, i.e. the part the planner
+    # controls (the delay coast is the same for every plan) [m]
+    min_sep_recovery: float = np.inf
 
     def summary(self) -> str:
         per_sat = ", ".join(
@@ -288,26 +307,58 @@ def _states_at_delay(
     return out
 
 
-def _rank_assignments(
+def _koz_free_costs(
     n: float,
     x_delay: list[np.ndarray],
     slots: list[np.ndarray],
     horizon: float,
-    n_keep: int | None,
-) -> list[tuple[int, ...]]:
-    """Rank slot permutations by a closed-form two-impulse cost heuristic."""
+    cfg: ScpConfig,
+    needed: set[tuple[int, int]],
+    active: list[bool],
+) -> tuple[np.ndarray, dict[tuple[int, int], np.ndarray]]:
+    """Keep-out-free minimum-fuel cost c[i, s] of sending satellite i to slot
+    s, for every (i, s) in `needed`, on the SCP's own burn grid with its
+    dv_max / fuel_max limits (see `_solve_convex_transfer`).
+
+    A satellite that can't burn (active[i] False) just coasts, as in the SCP,
+    so it costs nothing (the caller only pairs it with its own slot).
+    Infeasible transfers get c = inf.
+
+    Returns (cost (n_sat, n_sat), {(i, s): dv (3, n_steps + 1)}).
+    """
     n_sat = len(x_delay)
-    cost = np.zeros((n_sat, n_sat))
-    for i in range(n_sat):
-        for s in range(n_sat):
-            try:
-                dv1, dv2 = cw_two_impulse(x_delay[i], n, horizon, slots[s])
-                cost[i, s] = np.linalg.norm(dv1) + np.linalg.norm(dv2)
-            except np.linalg.LinAlgError:
-                cost[i, s] = np.inf
-    perms = list(itertools.permutations(range(n_sat)))
-    perms.sort(key=lambda p: sum(cost[i, p[i]] for i in range(n_sat)))
-    return perms[:n_keep] if n_keep is not None else perms
+    n_steps = max(2, int(round(horizon / cfg.dt)))  # same grid as the SCP
+    cost = np.full((n_sat, n_sat), np.inf)
+    dvs: dict[tuple[int, int], np.ndarray] = {}
+    for i, s in sorted(needed):
+        if not active[i]:
+            cost[i, s] = 0.0
+            dvs[i, s] = np.zeros((3, n_steps + 1))
+            continue
+        dv, _ = _solve_convex_transfer(
+            n, x_delay[i], slots[s], horizon, n_steps,
+            cfg.dv_max, cfg.fuel_max, cfg.solver,
+        )
+        if dv is not None:
+            cost[i, s] = float(np.linalg.norm(dv, axis=0).sum())
+            dvs[i, s] = dv
+    return cost, dvs
+
+
+def _assignment_lower_bound(
+    cost: np.ndarray, perm: tuple[int, ...], cfg: ScpConfig, tf: float
+) -> float:
+    """Exact keep-out-free optimum of assignment `perm`, a lower bound on its
+    SCP objective.
+
+    Without the keep-out the satellites decouple, and the objective
+    sum_i f_i + w_balance * max_i f_i is nondecreasing in every f_i, so each
+    satellite flying its own minimum-fuel transfer is jointly optimal.
+    """
+    c = np.array([cost[i, s] for i, s in enumerate(perm)])
+    if not np.all(np.isfinite(c)):
+        return np.inf
+    return float(c.sum() + cfg.w_balance * c.max() + cfg.w_tf * tf)
 
 
 def _solve_fixed_assignment(
@@ -575,13 +626,23 @@ def _score_burns(
             sat.x0, n, times, all_imp
         )
     names = [s.name for s in satellites]
-    min_sep = np.inf
+    after = times >= t_delay
+    min_sep = min_sep_rec = np.inf
     for i, j in itertools.combinations(range(len(names)), 2):
         d = np.linalg.norm(
             trajectories[names[i]][:, :3] - trajectories[names[j]][:, :3],
             axis=1,
         )
         min_sep = min(min_sep, float(d.min()))
+        if after.any():
+            min_sep_rec = min(min_sep_rec, float(d[after].min()))
+
+    # Same terms the SCP minimizes (fuel + balancing + slack penalty), plus
+    # the tf weight, so plans from different assignments / tf compare fairly.
+    objective = (total_dv
+                 + cfg.w_balance * max(per_sat_dv.values(), default=0.0)
+                 + cfg.w_tf * tf
+                 + cfg.w_slack * slack_max)
 
     return RecoveryPlan(
         burns=burns,
@@ -590,13 +651,14 @@ def _score_burns(
         per_sat_dv=per_sat_dv,
         tf=tf,
         t_delay=t_delay,
-        objective=total_dv + cfg.w_tf * tf + cfg.w_slack * slack_max,
+        objective=objective,
         min_separation=min_sep,
         slack_max=slack_max,
         iterations=iters,
         converged=converged,
         times=times,
         trajectories=trajectories,
+        min_sep_recovery=min_sep_rec,
     )
 
 
@@ -610,12 +672,12 @@ def plan_recovery(
     t_delay: float,
     tf: float | list[float],
     config: ScpConfig | None = None,
-    n_assignments: int | None = None,
     verbose: bool = False,
     allow_reslot: bool = True,
     initial_guess: InitialGuess = ballistic_guess,
     collision_avoidance: bool = True,
     controlled: Collection[str] | None = None,
+    prune: bool = True,
 ) -> RecoveryPlan:
     """Plan the minimum-cost multi-satellite recovery via SCP.
 
@@ -628,8 +690,6 @@ def plan_recovery(
     tf : recovery time [s], or a list of candidate times. With a list, each
         candidate is solved and the best objective total_dv + w_tf*tf wins
         (set config.w_tf > 0 to actually trade fuel against recovery time).
-    n_assignments : how many of the heuristically-ranked slot permutations
-        to solve exactly.
     allow_reslot : if False, every satellite must return to its own slot
         (identity assignment only), which matches the single-satellite
         baselines' problem.
@@ -650,40 +710,98 @@ def plan_recovery(
         slot, but the controlled satellites must still avoid them. Pass
         just the perturbed satellite to match the single-satellite
         baselines without letting the SCP move neighbours out of the way.
+    prune : branch and bound over assignments (see the module docstring):
+        skip the SCP when an assignment's keep-out-free optimum already
+        clears the keep-out (d_min + collision_margin over t >= t_delay),
+        and stop once no remaining lower bound can beat the best
+        keep-out-compliant plan. False solves the SCP for every allowed
+        assignment, e.g. to check the pruning.
+
+    Plans are ranked keep-out-compliant first (min_sep_recovery >= d_min;
+    ignored with collision_avoidance=False), then by objective.
     """
     cfg = config or ScpConfig()
     n = chief_orbit.mean_motion
+    n_sat = len(satellites)
     slots = [sat.x0.copy() for sat in satellites]
     names = [sat.name for sat in satellites]
     if controlled is None:
-        active = [True] * len(satellites)
+        active = [True] * n_sat
     else:
         unknown = set(controlled) - set(names)
         if unknown:
             raise ValueError(f"controlled names not in the formation: {sorted(unknown)}")
         active = [name in controlled for name in names]
     tf_candidates = np.atleast_1d(np.asarray(tf, dtype=float))
+    x_delay = _states_at_delay(n, satellites, t_delay)
 
-    best: RecoveryPlan | None = None
-    for tf_c in tf_candidates:
+    perms = (list(itertools.permutations(range(n_sat))) if allow_reslot
+             else [tuple(range(n_sat))])
+    # A satellite that can't burn keeps its own slot.
+    perms = [p for p in perms
+             if all(p[i] == i for i in range(n_sat) if not active[i])]
+    needed = {(i, p[i]) for p in perms for i in range(n_sat)}
+
+    # Keep-out-free lower bound for every (tf, assignment); visit in
+    # increasing order across all tf candidates.
+    candidates: list[tuple[float, int, tuple[int, ...]]] = []
+    koz_free: list[dict[tuple[int, int], np.ndarray]] = []
+    for t_idx, tf_c in enumerate(tf_candidates):
         horizon = tf_c - t_delay
         if horizon <= 0:
             raise ValueError("tf must exceed t_delay")
-        x_delay = _states_at_delay(n, satellites, t_delay)
-        perms = (
-            _rank_assignments(n, x_delay, slots, horizon, n_assignments)
-            if allow_reslot else [tuple(range(len(satellites)))]
+        cost, dvs = _koz_free_costs(
+            n, x_delay, slots, horizon, cfg, needed, active
         )
-        # A satellite that can't burn keeps its own slot.
-        perms = [p for p in perms
-                 if all(p[i] == i for i in range(len(p)) if not active[i])]
+        koz_free.append(dvs)
         for perm in perms:
+            lb = _assignment_lower_bound(cost, perm, cfg, tf_c)
+            if np.isfinite(lb):
+                candidates.append((lb, t_idx, perm))
+            elif verbose:
+                print(f"  tf={tf_c / 60:.1f} min, assignment {perm}: "
+                      "keep-out-free transfer infeasible, skipped")
+    candidates.sort(key=lambda c: c[0])
+
+    def safe(plan: RecoveryPlan) -> bool:
+        return not collision_avoidance or plan.min_sep_recovery >= cfg.d_min
+
+    def rank(plan: RecoveryPlan) -> tuple[bool, float]:
+        return (not safe(plan), plan.objective)
+
+    d_req = cfg.d_min + cfg.collision_margin
+    best: RecoveryPlan | None = None
+    for lb, t_idx, perm in candidates:
+        tf_c = tf_candidates[t_idx]
+        if prune and best is not None and safe(best) and lb >= best.objective:
             if verbose:
-                print(f"  tf={tf_c / 60:.1f} min, assignment {perm}:")
+                print(f"  pruned the rest: lower bound {lb:.4f} >= best "
+                      f"objective {best.objective:.4f}")
+            break
+        if verbose:
+            print(f"  tf={tf_c / 60:.1f} min, assignment {perm} "
+                  f"(lower bound {lb:.4f}):")
+
+        plan = None
+        if prune:
+            # The keep-out-free optimum is exact if it already clears the
+            # keep-out, so the SCP can't improve on it.
+            free = _finalize_plan(
+                chief_orbit, satellites,
+                [koz_free[t_idx][i, perm[i]] for i in range(n_sat)],
+                perm, t_delay, tf_c, cfg, slack_max=0.0, iters=1,
+                converged=True, polish=True,
+            )
+            if not collision_avoidance or free.min_sep_recovery >= d_req:
+                plan = free
+                if verbose:
+                    print("    keep-out inactive: keep-out-free optimum is "
+                          "exact, SCP skipped")
+        if plan is None:
             res = _solve_fixed_assignment(
-                n, x_delay, [slots[perm[i]] for i in range(len(satellites))],
-                horizon, cfg, verbose, initial_guess, collision_avoidance,
-                active,
+                n, x_delay, [slots[perm[i]] for i in range(n_sat)],
+                tf_c - t_delay, cfg, verbose, initial_guess,
+                collision_avoidance, active,
             )
             if res is None:
                 if verbose:
@@ -695,10 +813,10 @@ def plan_recovery(
                 cfg, slack_max, iters, converged,
                 polish=not collision_avoidance,
             )
-            if verbose:
-                print(f"    -> {plan.summary()}")
-            if best is None or plan.objective < best.objective:
-                best = plan
+        if verbose:
+            print(f"    -> {plan.summary()}")
+        if best is None or rank(plan) < rank(best):
+            best = plan
     if best is None:
         raise RuntimeError("SCP failed for every assignment / tf candidate")
     return best

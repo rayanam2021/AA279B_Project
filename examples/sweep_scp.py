@@ -99,7 +99,6 @@ DIRECTIONS = {
 # Coarser burn grid than the ScpConfig default keeps a solve to a few seconds;
 # the margin pads d_min for the excursion between keep-out samples.
 SCP_CONFIG = ScpConfig(dt=300.0, n_sub=4, max_iters=6, collision_margin=5.0)
-N_ASSIGNMENTS = 3   # ranked slot permutations the SCP solves exactly
 PERMS = list(itertools.permutations(range(3)))
 IDENTITY = PERMS.index((0, 1, 2))
 
@@ -162,7 +161,7 @@ def solve_cell(task):
     out = []
     plan = None
     for kw in (dict(allow_reslot=False),
-               dict(allow_reslot=True, n_assignments=N_ASSIGNMENTS)):
+               dict(allow_reslot=True)):
         try:
             plan = plan_recovery(chief, sats, t_delay, tf, cfg, **kw)
         except RuntimeError:
@@ -395,8 +394,7 @@ def plot_reorder_case(direction, mag, delay_orb, transfer_orb, cfg,
                                chief, sats, "Sat-1", t_delay, tf, cfg)))
     except np.linalg.LinAlgError:
         pass
-    reorder = plan_recovery(chief, sats, t_delay, tf, cfg,
-                            n_assignments=N_ASSIGNMENTS)
+    reorder = plan_recovery(chief, sats, t_delay, tf, cfg)
     if reorder.assignment != (0, 1, 2):
         candidates.append(("reordered plan folded to fixed order",
                            folded_plan(chief, sats, reorder, cfg)))

@@ -211,7 +211,6 @@ with open(OUTPUT_CSV, "w", newline="") as csvfile:
                             t_delay,
                             tf,
                             cfg,
-                            n_assignments=2,
                         )
 
                         scp_dv = scp.total_dv

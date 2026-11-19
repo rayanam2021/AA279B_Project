@@ -63,7 +63,7 @@ def run_case(chief, direction, mag, delay_orb, tf_orb, cfg):
     t_delay = delay_orb * chief.period
     tf = tf_orb * chief.period
     base = baseline_two_impulse_plan(chief, sats, "Sat-2", t_delay, tf, cfg)
-    scp = plan_recovery(chief, sats, t_delay, tf, cfg, n_assignments=2)
+    scp = plan_recovery(chief, sats, t_delay, tf, cfg)
     return base, scp
 
 

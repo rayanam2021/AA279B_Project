@@ -16,7 +16,9 @@ sep_at_delay column, or recomputes it from the scenario for older CSVs.
 
 Each sweep is labelled from its filename, sweep_<label>_<date>_<time>.csv,
 so two configurations of the same method (e.g. sweep_scp_*.csv and
-sweep_scp_two_imp_*.csv, both method=scp) are kept apart. Override with --labels.
+sweep_scp_two_imp_*.csv, both method=scp) are kept apart. When two sweeps share
+a label, each gets its run date and time appended, e.g.
+"scp_reslot_convex (11-18 09:12)". Override with --labels.
 
 Run:
     python my_trade_studies/plot_sweep_comparison.py                      # latest CSV per label
@@ -30,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap, LogNorm
 from matplotlib.patches import Patch
+from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
 from configurable_scp_sweep import CONFIG, RESULTS_DIR, load_sweep, separation_at_delay
 
@@ -51,6 +54,35 @@ plt.rcParams.update({
 def sweep_label(path: Path) -> str:
     """Label from a sweep filename: sweep_<label>_<date>_<time>.csv -> <label>."""
     return path.stem.removeprefix("sweep_").rsplit("_", 2)[0]
+
+
+def sweep_stamp(path: Path) -> str:
+    """Run time from a sweep filename, sweep_<label>_YYYYMMDD_HHMMSS.csv -> 'MM-DD HH:MM'."""
+    date, time = path.stem.rsplit("_", 2)[1:]
+    if len(date) == 8 and len(time) >= 4 and (date + time).isdigit():
+        return f"{date[4:6]}-{date[6:]} {time[:2]}:{time[2:4]}"
+    return f"{date}_{time}"
+
+
+def unique_labels(paths: list[Path]) -> list[str]:
+    """Filename labels, with the run date/time appended wherever two sweeps share a label."""
+    base = [sweep_label(p) for p in paths]
+    labels = [f"{b} ({sweep_stamp(p)})" if base.count(b) > 1 else b for b, p in zip(base, paths)]
+    # same file (or same minute) twice: number the repeats
+    return [lab if labels[:i].count(lab) == 0 else f"{lab} #{labels[:i].count(lab) + 1}"
+            for i, lab in enumerate(labels)]
+
+
+def two_line(label: str) -> str:
+    """Put a trailing '(date time)' on its own line, for narrow axis labels."""
+    return label.replace(" (", "\n(", 1)
+
+
+def plain_log_ticks(axis):
+    """Log axis ticks at 1, 2, 5 x 10^k labelled as plain numbers (0.05, 0.1, 0.2)."""
+    axis.set_major_locator(LogLocator(subs=(1, 2, 5)))
+    axis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    axis.set_minor_formatter(NullFormatter())
 
 
 def latest_per_method() -> list[Path]:
@@ -81,8 +113,10 @@ def case_lookup(r, exclude_koz=False) -> dict[tuple, float]:
 
 def plot_dv_maps(sweeps: dict, out: Path):
     """Heatmap of total dv over (theta, delay); rows = methods, columns = dv magnitude."""
-    first = next(iter(sweeps.values()))
-    thetas, mags, delays = (np.unique(first[k]) for k in ("theta_deg", "dv_mag", "delay_orbits"))
+    # union of every sweep's grid, so a sweep with extra angles / magnitudes is not cropped
+    thetas, mags, delays = (np.unique(np.concatenate([r[k] for r in sweeps.values()]))
+                            for k in ("theta_deg", "dv_mag", "delay_orbits"))
+    xticks = [t for t in range(0, 360, 45) if thetas.min() <= t <= thetas.max()]
     all_dv = np.concatenate([np.where(r["koz_start"], np.nan, r["total_dv"])
                              for r in sweeps.values()])
     norm = LogNorm(np.nanmin(all_dv[all_dv > 0]), np.nanmax(all_dv))
@@ -91,7 +125,8 @@ def plot_dv_maps(sweeps: dict, out: Path):
     koz_cmap = ListedColormap([KOZ_START])
     koz_cmap.set_bad((0, 0, 0, 0))  # transparent where the case starts clear
 
-    fig, axes = plt.subplots(len(sweeps), len(mags), figsize=(3.2 * len(mags), 2.2 * len(sweeps) + 0.8),
+    fig, axes = plt.subplots(len(sweeps), len(mags),
+                             figsize=(max(3.2 * len(mags) + 2.2, 6.5), 2.4 * len(sweeps) + 1.4),
                              sharex=True, sharey=True, squeeze=False, layout="constrained")
     for row, (method, r) in enumerate(sweeps.items()):
         lookup = case_lookup(r, exclude_koz=True)
@@ -107,20 +142,23 @@ def plot_dv_maps(sweeps: dict, out: Path):
             ax.pcolormesh(thetas, np.arange(len(delays)), koz_grid, cmap=koz_cmap,
                           shading="nearest", edgecolors=SURFACE, linewidth=0.5)
             ax.set_yticks(range(len(delays)), [f"{d:g}" for d in delays])
-            ax.set_xticks([0, 90, 180, 270])
+            ax.set_xticks(xticks)
             ax.tick_params(length=0)
             for side in ax.spines.values():
                 side.set_visible(False)
             if row == 0:
                 ax.set_title(f"disturbance {mag:g} m/s")
             if col == 0:
-                ax.set_ylabel(f"{method}\ndelay [orbits]")
-    fig.colorbar(im, ax=axes, label="total recovery Δv [m/s]", shrink=0.9, pad=0.01)
+                ax.set_ylabel(f"{two_line(method)}\ndelay [orbits]", fontsize=8.5)
+            if row == len(sweeps) - 1:
+                ax.set_xlabel("disturbance angle θ [deg]\n(0 radial, 90 along-track)")
+    cb = fig.colorbar(im, ax=axes, label="total recovery Δv [m/s]", shrink=0.9, pad=0.02)
+    plain_log_ticks(cb.ax.yaxis)
+    cb.ax.tick_params(labelsize=8)
     fig.legend(handles=[Patch(color=KOZ_START, label="starts inside keep-out (excluded)"),
                         Patch(color=MISSING, label="failed / missing")],
-               loc="outside lower right", ncol=2, frameon=False, fontsize=8)
-    fig.supxlabel("disturbance angle θ [deg]  (0 radial, 90 along-track)", color=INK_2, fontsize=9)
-    fig.suptitle("Total recovery Δv across the sweep", color=INK)
+               loc="outside lower center", ncol=2, frameon=False, fontsize=8)
+    fig.suptitle("Total recovery Δv across the sweep", color=INK, fontsize=11)
     fig.savefig(out, dpi=200)
     print(f"saved {out}")
 
@@ -134,12 +172,14 @@ def plot_comparison(name_a, ra, name_b, rb, thetas, out: Path):
     lo = min(min(la[k], lb[k]) for k in shared) / 1.3
     hi = max(max(la[k], lb[k]) for k in shared) * 1.3
 
-    fig, axes = plt.subplots(1, len(thetas), figsize=(4.6 * len(thetas), 4.6),
+    fig, axes = plt.subplots(1, len(thetas), figsize=(max(5.2 * len(thetas), 6.5), 5.9),
                              squeeze=False, layout="constrained")
     for ax, theta in zip(axes[0], thetas):
         ax.plot([lo, hi], [lo, hi], color=MUTED, lw=1, ls="--", zorder=1)
-        ax.text(hi / 1.15, lo * 1.15, f"{name_b} cheaper", ha="right", va="bottom", color=MUTED)
-        ax.text(lo * 1.15, hi / 1.15, f"{name_a} cheaper", ha="left", va="top", color=MUTED)
+        ax.text(0.97, 0.03, "B cheaper", transform=ax.transAxes, ha="right", va="bottom",
+                color=MUTED, fontsize=9)
+        ax.text(0.03, 0.97, "A cheaper", transform=ax.transAxes, ha="left", va="top",
+                color=MUTED, fontsize=9)
         for delay, color in zip(delays, DELAY_COLORS * 2):
             keys = [(theta, m, delay) for m in mags if (theta, m, delay) in shared]
             if not keys:
@@ -149,15 +189,17 @@ def plot_comparison(name_a, ra, name_b, rb, thetas, out: Path):
             order = np.argsort(a)
             ax.plot(a[order], b[order], color=color, lw=1, alpha=0.6, zorder=2)
             ax.scatter(a, b, s=48, color=color, edgecolors=SURFACE, linewidths=1.5, zorder=2,
-                       label=f"{delay:g} orbits  ({name_b} cheaper {np.sum(b < a)}/{len(keys)})")
+                       label=f"{delay:g} orbits   B cheaper {np.sum(b < a)}/{len(keys)}")
         ax.set(xscale="log", yscale="log", xlim=(lo, hi), ylim=(lo, hi), aspect="equal",
-               xlabel=f"{name_a} total Δv [m/s]", ylabel=f"{name_b} total Δv [m/s]",
+               xlabel=f"A: {name_a}\ntotal Δv [m/s]", ylabel=f"B: {name_b}\ntotal Δv [m/s]",
                title=f"θ = {theta:g}°  (one point per disturbance magnitude)")
+        for axis in (ax.xaxis, ax.yaxis):
+            plain_log_ticks(axis)
         ax.grid(color=GRID, lw=0.5, which="major")
-        ax.legend(title="reaction delay", frameon=False, fontsize=8, title_fontsize=8, loc="upper left",
-                  bbox_to_anchor=(0, 0.92))
-    fig.suptitle(f"{name_a} vs {name_b}  (cases starting inside the keep-out excluded)",
-                 color=INK)
+        ax.legend(title="reaction delay", frameon=False, fontsize=8, title_fontsize=8,
+                  loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2)
+    fig.suptitle(f"A: {name_a}   vs   B: {name_b}\n"
+                 "(cases starting inside the keep-out excluded)", color=INK, fontsize=10)
     fig.savefig(out, dpi=200)
     print(f"saved {out}")
 
@@ -191,15 +233,18 @@ def main():
     args = parser.parse_args()
 
     paths = args.csvs or latest_per_method()
+    not_csv = [p.name for p in paths if p.suffix != ".csv"]
+    if not_csv:
+        parser.error(f"expected sweep result CSVs, got {', '.join(not_csv)}")
     if args.labels and len(args.labels) != len(paths):
         parser.error(f"--labels needs {len(paths)} names, got {len(args.labels)}")
+    labels = args.labels or unique_labels(paths)
+    if len(set(labels)) != len(labels):
+        parser.error(f"--labels must be distinct, got {labels}")
     sweeps = {}
-    for i, path in enumerate(paths):
+    for label, path in zip(labels, paths):
         r = load_sweep(path)
         r["koz_start"] = starts_in_koz(r)
-        label = args.labels[i] if args.labels else sweep_label(path)
-        if label in sweeps:  # same label twice (e.g. two runs of one config)
-            label = f"{label} ({path.stem.split('_', 1)[1].rsplit('_', 2)[-2]})"
         sweeps[label] = r
         print(f"{path.name}: label={label}, method={r['method'][0]}, "
               f"{len(r['total_dv'])} cases, {np.sum(r['status'] != 'ok')} failed, "
